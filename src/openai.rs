@@ -19,8 +19,16 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn from_config(config: &OpenAiConfig) -> Result<Self, ProviderError> {
-        let api_key = read_api_key(config.api_key_env())?;
-        Ok(Self::new(config.base_url(), api_key, config.model()))
+        Self::from_settings(config.base_url(), config.api_key_env(), config.model())
+    }
+
+    pub fn from_settings(
+        base_url: &str,
+        api_key_env: &str,
+        model: &str,
+    ) -> Result<Self, ProviderError> {
+        let api_key = read_api_key(api_key_env)?;
+        Ok(Self::new(base_url, api_key, model))
     }
 
     fn new(base_url: &str, api_key: String, model: &str) -> Self {

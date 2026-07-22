@@ -2,30 +2,37 @@ mod config;
 mod conversation;
 mod message;
 mod openai;
+mod session;
+mod store;
 mod stream;
 mod terminal;
 
-use config::{Agent, Config, ConfigError};
+use config::{Config, ConfigError};
 use conversation::Conversation;
 use futures_util::{Stream, StreamExt};
-use message::Message;
+use message::{Message, MessageRole};
 use openai::{OpenAiClient, ProviderError};
+use session::{AgentSnapshot, SessionId, SessionIdError};
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
-use stream::StreamEvent;
+use store::{Store, StoreError};
+use stream::{Completion, StreamEvent};
 use terminal::InputSuppression;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 const CONFIG_PATH: &str = "tapet.toml";
+const DATABASE_PATH: &str = ".tapet/tapet.db";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Ask { agent: String, message: String },
     Chat { agent: String },
+    Attach { session: SessionId },
+    History { session: SessionId },
 }
 
 fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command, AppError> {
@@ -51,6 +58,20 @@ fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command,
             }
             Ok(Command::Chat { agent })
         }
+        "attach" => {
+            let session = next_argument(&mut args)?.parse()?;
+            if args.next().is_some() {
+                return Err(AppError::Usage);
+            }
+            Ok(Command::Attach { session })
+        }
+        "history" => {
+            let session = next_argument(&mut args)?.parse()?;
+            if args.next().is_some() {
+                return Err(AppError::Usage);
+            }
+            Ok(Command::History { session })
+        }
         _ => Err(AppError::Usage),
     }
 }
@@ -64,39 +85,94 @@ fn next_argument(args: &mut impl Iterator<Item = OsString>) -> Result<String, Ap
 
 async fn try_main() -> Result<(), AppError> {
     let command = selected_command(env::args_os().skip(1))?;
-    let config = Config::load(Path::new(CONFIG_PATH))?;
 
     match command {
         Command::Ask {
             agent: agent_name,
             message,
         } => {
+            let config = Config::load(Path::new(CONFIG_PATH))?;
             let agent = config.agent(&agent_name)?;
             let client = OpenAiClient::from_config(config.openai())?;
             let messages = [Message::user(message)];
             let stdout = io::stdout();
-            render_response(agent, &client, &messages, &mut stdout.lock()).await?;
+            render_response(
+                agent.name(),
+                agent.prompt(),
+                &client,
+                &messages,
+                &mut stdout.lock(),
+            )
+            .await?;
         }
         Command::Chat { agent: agent_name } => {
+            let config = Config::load(Path::new(CONFIG_PATH))?;
             let agent = config.agent(&agent_name)?;
-            let client = OpenAiClient::from_config(config.openai())?;
+            let snapshot = AgentSnapshot::resolve(agent, config.openai());
+            let store = Store::open(DATABASE_PATH).await?;
+            let session = store.create_session(snapshot).await?;
+            let client = client_for_session(&session)?;
             let input = BufReader::new(tokio::io::stdin());
             let stdout = io::stdout();
-            run_chat(agent, &client, input, stdout.lock()).await?;
+            let mut output = stdout.lock();
+            writeln!(output, "Session {}", session.id())?;
+            run_chat(Conversation::new(store, session), &client, input, output).await?;
+        }
+        Command::Attach { session: id } => {
+            let store = Store::open(DATABASE_PATH).await?;
+            let session = store.load_session(&id).await?;
+            let client = client_for_session(&session)?;
+            let input = BufReader::new(tokio::io::stdin());
+            let stdout = io::stdout();
+            run_chat(
+                Conversation::new(store, session),
+                &client,
+                input,
+                stdout.lock(),
+            )
+            .await?;
+        }
+        Command::History { session: id } => {
+            let store = Store::open(DATABASE_PATH).await?;
+            let session = store.load_session(&id).await?;
+            let messages = store.history(&id).await?;
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            write_history(session.agent().agent_name(), &messages, &mut output)?;
         }
     }
 
     Ok(())
 }
 
+fn client_for_session(session: &session::Session) -> Result<OpenAiClient, ProviderError> {
+    let agent = session.agent();
+    OpenAiClient::from_settings(agent.base_url(), agent.api_key_env(), agent.model())
+}
+
+fn write_history(
+    agent_name: &str,
+    messages: &[Message],
+    output: &mut impl Write,
+) -> io::Result<()> {
+    for message in messages {
+        let speaker = match message.role() {
+            MessageRole::User => "you",
+            MessageRole::Assistant => agent_name,
+        };
+        writeln!(output, "{speaker}> {}", message.content())?;
+    }
+    Ok(())
+}
+
 async fn run_chat(
-    agent: &Agent,
+    conversation: Conversation,
     client: &OpenAiClient,
     mut input: impl AsyncBufRead + Unpin,
     mut output: impl Write,
 ) -> Result<(), AppError> {
-    writeln!(output, "{}> ready", agent.name())?;
-    let mut conversation = Conversation::new();
+    let agent = conversation.session().agent();
+    writeln!(output, "{}> ready", agent.agent_name())?;
 
     loop {
         let input_action = tokio::select! {
@@ -115,38 +191,55 @@ async fn run_chat(
         };
 
         let input_suppression = InputSuppression::start()?;
-        let interrupted = tokio::select! {
-            result = conversation.turn(message, |messages| {
-                let output = &mut output;
-                async move {
-                    render_response(agent, client, &messages, output).await
-                }
-            }) => {
-                result?;
-                false
-            },
-            result = tokio::signal::ctrl_c() => {
-                result?;
-                true
-            }
+        let turn = conversation.begin_turn(message).await?;
+        let outcome = tokio::select! {
+            result = render_response(
+                agent.agent_name(),
+                agent.system_prompt(),
+                client,
+                turn.messages(),
+                &mut output,
+            ) => TurnOutcome::Response(result),
+            result = tokio::signal::ctrl_c() => TurnOutcome::Interrupted(result),
         };
         drop(input_suppression);
 
-        if interrupted {
-            writeln!(output)?;
-            return Ok(());
+        match outcome {
+            TurnOutcome::Response(Ok(response)) => {
+                turn.complete(response.text, response.completion).await?;
+            }
+            TurnOutcome::Response(Err(error)) => {
+                turn.fail(error.to_string()).await?;
+                return Err(error);
+            }
+            TurnOutcome::Interrupted(signal) => {
+                let failure = match &signal {
+                    Ok(()) => "cancelled by user".to_owned(),
+                    Err(error) => format!("failed to listen for Ctrl-C: {error}"),
+                };
+                turn.fail(failure).await?;
+                signal?;
+                writeln!(output)?;
+                return Ok(());
+            }
         }
     }
 }
 
+enum TurnOutcome {
+    Response(Result<AssistantResponse, AppError>),
+    Interrupted(io::Result<()>),
+}
+
 async fn render_response(
-    agent: &Agent,
+    agent_name: &str,
+    system_prompt: &str,
     client: &OpenAiClient,
     messages: &[Message],
     output: &mut impl Write,
-) -> Result<String, AppError> {
-    let events = client.stream(agent.prompt(), messages).await?;
-    write!(output, "{}> ", agent.name())?;
+) -> Result<AssistantResponse, AppError> {
+    let events = client.stream(system_prompt, messages).await?;
+    write!(output, "{agent_name}> ")?;
     output.flush()?;
 
     match render_events(events, output).await {
@@ -161,7 +254,16 @@ async fn render_response(
     }
 }
 
-async fn render_events<S>(mut events: S, output: &mut impl Write) -> Result<String, AppError>
+#[derive(Debug)]
+struct AssistantResponse {
+    text: String,
+    completion: Completion,
+}
+
+async fn render_events<S>(
+    mut events: S,
+    output: &mut impl Write,
+) -> Result<AssistantResponse, AppError>
 where
     S: Stream<Item = Result<StreamEvent, ProviderError>> + Unpin,
 {
@@ -174,7 +276,12 @@ where
                 output.flush()?;
                 message.push_str(&delta);
             }
-            StreamEvent::Completed(_) => return Ok(message),
+            StreamEvent::Completed(completion) => {
+                return Ok(AssistantResponse {
+                    text: message,
+                    completion,
+                });
+            }
         }
     }
 
@@ -218,20 +325,30 @@ async fn main() {
 
 #[derive(Debug, Error)]
 enum AppError {
-    #[error("usage: tapet ask <agent> <message>\n       tapet chat <agent>")]
+    #[error(
+        "usage: tapet ask <agent> <message>\n       tapet chat <agent>\n       tapet attach <session>\n       tapet history <session>"
+    )]
     Usage,
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error(transparent)]
+    SessionId(#[from] SessionIdError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, UserInput, read_user_input, render_events, selected_command};
+    use super::{
+        Command, UserInput, read_user_input, render_events, selected_command, write_history,
+    };
+    use crate::message::Message;
     use crate::openai::{ProviderError, decode_stream};
+    use crate::session::SessionId;
     use crate::stream::{Completion, StreamEvent};
     use futures_util::stream;
     use std::ffi::OsString;
@@ -265,10 +382,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_attach_and_history_commands() {
+        let id = "ses_550e8400e29b41d4a716446655440000";
+        let session: SessionId = id.parse().unwrap();
+
+        assert_eq!(
+            selected_command([OsString::from("attach"), OsString::from(id)].into_iter()).unwrap(),
+            Command::Attach {
+                session: session.clone()
+            }
+        );
+        assert_eq!(
+            selected_command([OsString::from("history"), OsString::from(id)].into_iter()).unwrap(),
+            Command::History { session }
+        );
+    }
+
+    #[test]
     fn rejects_incomplete_or_extra_arguments() {
         assert!(selected_command(std::iter::empty()).is_err());
         assert!(selected_command([OsString::from("ask")].into_iter()).is_err());
         assert!(selected_command([OsString::from("chat")].into_iter()).is_err());
+        assert!(
+            selected_command(
+                [OsString::from("attach"), OsString::from("not-a-session")].into_iter()
+            )
+            .is_err()
+        );
         assert!(
             selected_command(
                 [
@@ -316,6 +456,23 @@ mod tests {
         assert_eq!(String::from_utf8(output).unwrap(), "you> ");
     }
 
+    #[test]
+    fn formats_session_history_with_speaker_names() {
+        let mut output = Vec::new();
+
+        write_history(
+            "explorer",
+            &[Message::user("Hello"), Message::assistant("Hi")],
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "you> Hello\nexplorer> Hi\n"
+        );
+    }
+
     #[tokio::test]
     async fn printed_deltas_are_the_stored_assistant_message() {
         let events = stream::iter([
@@ -327,8 +484,8 @@ mod tests {
 
         let message = render_events(events, &mut output).await.unwrap();
 
-        assert_eq!(message, "Ownership");
-        assert_eq!(String::from_utf8(output.bytes).unwrap(), message);
+        assert_eq!(message.text, "Ownership");
+        assert_eq!(String::from_utf8(output.bytes).unwrap(), message.text);
         assert_eq!(output.flushes, 2);
     }
 
