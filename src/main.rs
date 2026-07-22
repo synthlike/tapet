@@ -2,9 +2,12 @@ mod config;
 mod conversation;
 mod message;
 mod openai;
+mod stream;
+mod terminal;
 
 use config::{Agent, Config, ConfigError};
 use conversation::Conversation;
+use futures_util::{Stream, StreamExt};
 use message::Message;
 use openai::{OpenAiClient, ProviderError};
 use std::env;
@@ -12,6 +15,8 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
+use stream::StreamEvent;
+use terminal::InputSuppression;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
@@ -69,10 +74,8 @@ async fn try_main() -> Result<(), AppError> {
             let agent = config.agent(&agent_name)?;
             let client = OpenAiClient::from_config(config.openai())?;
             let messages = [Message::user(message)];
-            let response = client.complete(agent.prompt(), &messages).await?;
-
             let stdout = io::stdout();
-            writeln!(stdout.lock(), "{}> {response}", agent.name())?;
+            render_response(agent, &client, &messages, &mut stdout.lock()).await?;
         }
         Command::Chat { agent: agent_name } => {
             let agent = config.agent(&agent_name)?;
@@ -111,20 +114,71 @@ async fn run_chat(
             UserInput::Exit => return Ok(()),
         };
 
-        let prompt = agent.prompt();
-        let response = tokio::select! {
-            result = conversation.turn(message, |messages| async move {
-                client.complete(prompt, &messages).await
-            }) => result?,
+        let input_suppression = InputSuppression::start()?;
+        let interrupted = tokio::select! {
+            result = conversation.turn(message, |messages| {
+                let output = &mut output;
+                async move {
+                    render_response(agent, client, &messages, output).await
+                }
+            }) => {
+                result?;
+                false
+            },
             result = tokio::signal::ctrl_c() => {
                 result?;
-                writeln!(output)?;
-                return Ok(());
+                true
             }
         };
+        drop(input_suppression);
 
-        writeln!(output, "{}> {response}", agent.name())?;
+        if interrupted {
+            writeln!(output)?;
+            return Ok(());
+        }
     }
+}
+
+async fn render_response(
+    agent: &Agent,
+    client: &OpenAiClient,
+    messages: &[Message],
+    output: &mut impl Write,
+) -> Result<String, AppError> {
+    let events = client.stream(agent.prompt(), messages).await?;
+    write!(output, "{}> ", agent.name())?;
+    output.flush()?;
+
+    match render_events(events, output).await {
+        Ok(message) => {
+            writeln!(output)?;
+            Ok(message)
+        }
+        Err(error) => {
+            let _ = writeln!(output);
+            Err(error)
+        }
+    }
+}
+
+async fn render_events<S>(mut events: S, output: &mut impl Write) -> Result<String, AppError>
+where
+    S: Stream<Item = Result<StreamEvent, ProviderError>> + Unpin,
+{
+    let mut message = String::new();
+
+    while let Some(event) = events.next().await {
+        match event? {
+            StreamEvent::TextDelta(delta) => {
+                output.write_all(delta.as_bytes())?;
+                output.flush()?;
+                message.push_str(&delta);
+            }
+            StreamEvent::Completed(_) => return Ok(message),
+        }
+    }
+
+    Err(ProviderError::IncompleteStream.into())
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -176,8 +230,12 @@ enum AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, UserInput, read_user_input, selected_command};
+    use super::{Command, UserInput, read_user_input, render_events, selected_command};
+    use crate::openai::{ProviderError, decode_stream};
+    use crate::stream::{Completion, StreamEvent};
+    use futures_util::stream;
     use std::ffi::OsString;
+    use std::io::{self, Write};
     use tokio::io::BufReader;
 
     #[test]
@@ -256,5 +314,67 @@ mod tests {
             UserInput::Exit
         );
         assert_eq!(String::from_utf8(output).unwrap(), "you> ");
+    }
+
+    #[tokio::test]
+    async fn printed_deltas_are_the_stored_assistant_message() {
+        let events = stream::iter([
+            Ok(StreamEvent::TextDelta("Owner".to_owned())),
+            Ok(StreamEvent::TextDelta("ship".to_owned())),
+            Ok(StreamEvent::Completed(completion())),
+        ]);
+        let mut output = TrackingWriter::default();
+
+        let message = render_events(events, &mut output).await.unwrap();
+
+        assert_eq!(message, "Ownership");
+        assert_eq!(String::from_utf8(output.bytes).unwrap(), message);
+        assert_eq!(output.flushes, 2);
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_completion_fails() {
+        let fixture = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+        );
+        let events = decode_stream(stream::iter([Ok::<_, io::Error>(
+            fixture.as_bytes().to_vec(),
+        )]));
+        let mut output = Vec::new();
+
+        let error = render_events(events, &mut output).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::AppError::Provider(ProviderError::IncompleteStream)
+        ));
+        assert_eq!(output, b"partial");
+    }
+
+    fn completion() -> Completion {
+        Completion {
+            provider_response_id: Some("resp_test".to_owned()),
+            input_tokens: 1,
+            output_tokens: 1,
+        }
+    }
+
+    #[derive(Default)]
+    struct TrackingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for TrackingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
     }
 }
