@@ -1,0 +1,4 @@
+version = 1
+
+[agents.explorer]
+prompt = "Explore the world and beyond. Make no mistakes."
