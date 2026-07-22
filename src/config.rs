@@ -7,10 +7,33 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const SUPPORTED_VERSION: u32 = 1;
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Debug)]
 pub struct Config {
+    openai: OpenAiConfig,
     agents: BTreeMap<String, Agent>,
+}
+
+#[derive(Debug)]
+pub struct OpenAiConfig {
+    base_url: String,
+    api_key_env: String,
+    model: String,
+}
+
+impl OpenAiConfig {
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn api_key_env(&self) -> &str {
+        &self.api_key_env
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
 }
 
 #[derive(Debug)]
@@ -33,7 +56,21 @@ impl Agent {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     version: u32,
+    openai: RawOpenAiConfig,
     agents: BTreeMap<String, RawAgent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOpenAiConfig {
+    #[serde(default = "default_openai_base_url")]
+    base_url: String,
+    api_key_env: String,
+    model: String,
+}
+
+fn default_openai_base_url() -> String {
+    DEFAULT_OPENAI_BASE_URL.to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +91,9 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
     UnsupportedVersion(u32),
+    InvalidOpenAi {
+        reason: &'static str,
+    },
     NoAgents,
     InvalidAgent {
         name: String,
@@ -85,6 +125,7 @@ impl Config {
         if raw.version != SUPPORTED_VERSION {
             return Err(ConfigError::UnsupportedVersion(raw.version));
         }
+        let openai = validate_openai(raw.openai)?;
         if raw.agents.is_empty() {
             return Err(ConfigError::NoAgents);
         }
@@ -107,7 +148,11 @@ impl Config {
             agents.insert(name.clone(), Agent { name, prompt });
         }
 
-        Ok(Self { agents })
+        Ok(Self { openai, agents })
+    }
+
+    pub fn openai(&self) -> &OpenAiConfig {
+        &self.openai
     }
 
     pub fn agent(&self, name: &str) -> Result<&Agent, ConfigError> {
@@ -118,6 +163,30 @@ impl Config {
                 available: self.agents.keys().cloned().collect(),
             })
     }
+}
+
+fn validate_openai(raw: RawOpenAiConfig) -> Result<OpenAiConfig, ConfigError> {
+    if raw.base_url.trim().is_empty() {
+        return Err(ConfigError::InvalidOpenAi {
+            reason: "`base_url` cannot be empty",
+        });
+    }
+    if raw.api_key_env.trim().is_empty() {
+        return Err(ConfigError::InvalidOpenAi {
+            reason: "`api_key_env` cannot be empty",
+        });
+    }
+    if raw.model.trim().is_empty() {
+        return Err(ConfigError::InvalidOpenAi {
+            reason: "`model` cannot be empty",
+        });
+    }
+
+    Ok(OpenAiConfig {
+        base_url: raw.base_url,
+        api_key_env: raw.api_key_env,
+        model: raw.model,
+    })
 }
 
 fn resolve_prompt(name: &str, raw_agent: RawAgent, base_dir: &Path) -> Result<String, ConfigError> {
@@ -180,6 +249,9 @@ impl fmt::Display for ConfigError {
                 formatter,
                 "unsupported configuration version {version}; expected {SUPPORTED_VERSION}"
             ),
+            Self::InvalidOpenAi { reason } => {
+                write!(formatter, "invalid OpenAI configuration: {reason}")
+            }
             Self::NoAgents => write!(formatter, "configuration must define at least one agent"),
             Self::InvalidAgent { name, reason } => {
                 write!(formatter, "invalid agent `{name}`: {reason}")
@@ -208,6 +280,7 @@ impl Error for ConfigError {
             Self::ReadConfig { source, .. } | Self::ReadPrompt { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::UnsupportedVersion(_)
+            | Self::InvalidOpenAi { .. }
             | Self::NoAgents
             | Self::InvalidAgent { .. }
             | Self::UnknownAgent { .. } => None,
@@ -217,7 +290,7 @@ impl Error for ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError};
+    use super::{Config, ConfigError, DEFAULT_OPENAI_BASE_URL};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -255,16 +328,32 @@ mod tests {
         }
     }
 
+    fn configuration(agent_tables: &str) -> String {
+        format!(
+            concat!(
+                "version = 1\n",
+                "[openai]\n",
+                "api_key_env = \"OPENAI_API_KEY\"\n",
+                "model = \"test-model\"\n",
+                "{agent_tables}"
+            ),
+            agent_tables = agent_tables
+        )
+    }
+
     #[test]
-    fn loads_an_inline_prompt() {
+    fn loads_openai_settings_and_an_inline_prompt() {
         let directory = TestDirectory::new();
         let path = directory.write(
             "tapet.toml",
-            "version = 1\n[agents.explorer]\nprompt = \"Explore carefully\"\n",
+            &configuration("[agents.explorer]\nprompt = \"Explore carefully\"\n"),
         );
 
         let config = Config::load(path).unwrap();
 
+        assert_eq!(config.openai().base_url(), DEFAULT_OPENAI_BASE_URL);
+        assert_eq!(config.openai().api_key_env(), "OPENAI_API_KEY");
+        assert_eq!(config.openai().model(), "test-model");
         assert_eq!(
             config.agent("explorer").unwrap().prompt(),
             "Explore carefully"
@@ -277,7 +366,7 @@ mod tests {
         directory.write("prompts/reviewer.md", "Review carefully\n");
         let path = directory.write(
             "tapet.toml",
-            "version = 1\n[agents.reviewer]\nprompt_file = \"prompts/reviewer.md\"\n",
+            &configuration("[agents.reviewer]\nprompt_file = \"prompts/reviewer.md\"\n"),
         );
 
         let config = Config::load(path).unwrap();
@@ -301,16 +390,39 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.write(
             "tapet.toml",
-            "version = 1\nunexpected = true\n[agents.explorer]\nprompt = \"Explore\"\n",
+            &configuration("unexpected = true\n[agents.explorer]\nprompt = \"Explore\"\n"),
         );
 
         assert!(matches!(Config::load(path), Err(ConfigError::Parse { .. })));
     }
 
     #[test]
+    fn rejects_invalid_openai_settings() {
+        let directory = TestDirectory::new();
+        let path = directory.write(
+            "tapet.toml",
+            concat!(
+                "version = 1\n",
+                "[openai]\n",
+                "api_key_env = \"\"\n",
+                "model = \"test-model\"\n",
+                "[agents.explorer]\n",
+                "prompt = \"Explore\"\n"
+            ),
+        );
+
+        assert!(matches!(
+            Config::load(path),
+            Err(ConfigError::InvalidOpenAi {
+                reason: "`api_key_env` cannot be empty"
+            })
+        ));
+    }
+
+    #[test]
     fn rejects_an_agent_without_a_prompt() {
         let directory = TestDirectory::new();
-        let path = directory.write("tapet.toml", "version = 1\n[agents.explorer]\n");
+        let path = directory.write("tapet.toml", &configuration("[agents.explorer]\n"));
 
         assert!(matches!(
             Config::load(path),
@@ -326,7 +438,7 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.write(
             "tapet.toml",
-            "version = 1\n[agents.explorer]\nprompt_file = \"missing.md\"\n",
+            &configuration("[agents.explorer]\nprompt_file = \"missing.md\"\n"),
         );
 
         assert!(matches!(
@@ -340,12 +452,11 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.write(
             "tapet.toml",
-            concat!(
-                "version = 1\n",
+            &configuration(concat!(
                 "[agents.explorer]\n",
                 "prompt = \"Explore\"\n",
                 "prompt_file = \"explorer.md\"\n"
-            ),
+            )),
         );
 
         assert!(matches!(
@@ -362,13 +473,12 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.write(
             "tapet.toml",
-            concat!(
-                "version = 1\n",
+            &configuration(concat!(
                 "[agents.reviewer]\n",
                 "prompt = \"Review\"\n",
                 "[agents.explorer]\n",
                 "prompt = \"Explore\"\n"
-            ),
+            )),
         );
         let config = Config::load(path).unwrap();
 

@@ -1,4 +1,9 @@
 version = 1
 
+[openai]
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-5.6-sol"
+
 [agents.explorer]
-prompt = "Explore the world and beyond. Make no mistakes."
+# prompt = "Explore the world and beyond. Make no mistakes."
+prompt = "Respond always in all caps"
