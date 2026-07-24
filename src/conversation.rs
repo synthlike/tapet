@@ -1,90 +1,106 @@
 use crate::message::Message;
-use std::future::Future;
+use crate::session::Session;
+use crate::store::{Store, StoreError};
+use crate::stream::Completion;
 
-#[derive(Debug, Default)]
 pub struct Conversation {
-    messages: Vec<Message>,
+    store: Store,
+    session: Session,
 }
 
 impl Conversation {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(store: Store, session: Session) -> Self {
+        Self { store, session }
     }
 
-    #[cfg(test)]
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    pub async fn begin_turn(&self, user_message: String) -> Result<RunningTurn, StoreError> {
+        let call = self
+            .store
+            .begin_call(self.session.id(), user_message)
+            .await?;
+        Ok(RunningTurn {
+            store: self.store.clone(),
+            call_id: call.call_id,
+            messages: call.messages,
+        })
+    }
+}
+
+pub struct RunningTurn {
+    store: Store,
+    call_id: i64,
+    messages: Vec<Message>,
+}
+
+impl RunningTurn {
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
 
-    pub async fn turn<E, F, Fut>(&mut self, user_message: String, request: F) -> Result<&str, E>
-    where
-        F: FnOnce(Vec<Message>) -> Fut,
-        Fut: Future<Output = Result<String, E>>,
-    {
-        self.messages.push(Message::user(user_message));
-        let assistant_message = request(self.messages.clone()).await?;
-        self.messages.push(Message::assistant(assistant_message));
+    pub async fn complete(
+        self,
+        assistant_message: String,
+        completion: Completion,
+    ) -> Result<(), StoreError> {
+        self.store
+            .complete_call(self.call_id, assistant_message, completion)
+            .await
+    }
 
-        Ok(self
-            .messages
-            .last()
-            .expect("the assistant message was just appended")
-            .content())
+    pub async fn fail(self, error: String) -> Result<(), StoreError> {
+        self.store.fail_call(self.call_id, error).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Conversation;
-    use crate::message::{Message, MessageRole};
-    use std::convert::Infallible;
-    use std::future::ready;
+    use crate::message::Message;
+    use crate::session::AgentSnapshot;
+    use crate::store::Store;
+    use crate::stream::Completion;
+    use tempfile::TempDir;
 
     #[tokio::test]
-    async fn the_second_request_contains_the_first_completed_turn() {
-        let mut conversation = Conversation::new();
+    async fn a_completed_turn_becomes_part_of_the_next_request() {
+        let temporary = TempDir::new().unwrap();
+        let store = Store::open(temporary.path().join("tapet.db"))
+            .await
+            .unwrap();
+        let session = store
+            .create_session(AgentSnapshot::fixture("Prompt"))
+            .await
+            .unwrap();
+        let conversation = Conversation::new(store, session);
 
-        conversation
-            .turn("What is ownership?".to_owned(), |messages| {
-                assert_eq!(messages, [Message::user("What is ownership?")]);
-                ready(Ok::<_, Infallible>("Ownership controls values.".to_owned()))
-            })
+        let first = conversation.begin_turn("First".to_owned()).await.unwrap();
+        assert_eq!(first.messages(), [Message::user("First")]);
+        first
+            .complete("Answer".to_owned(), completion())
             .await
             .unwrap();
 
-        conversation
-            .turn("How does borrowing relate?".to_owned(), |messages| {
-                assert_eq!(
-                    messages,
-                    [
-                        Message::user("What is ownership?"),
-                        Message::assistant("Ownership controls values."),
-                        Message::user("How does borrowing relate?")
-                    ]
-                );
-                ready(Ok::<_, Infallible>(
-                    "Borrowing grants temporary access.".to_owned(),
-                ))
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(conversation.messages().len(), 4);
+        let second = conversation.begin_turn("Second".to_owned()).await.unwrap();
+        assert_eq!(
+            second.messages(),
+            [
+                Message::user("First"),
+                Message::assistant("Answer"),
+                Message::user("Second")
+            ]
+        );
+        second.fail("test cleanup".to_owned()).await.unwrap();
     }
 
-    #[tokio::test]
-    async fn a_failed_response_does_not_append_an_assistant_message() {
-        let mut conversation = Conversation::new();
-
-        let result = conversation
-            .turn("Will this fail?".to_owned(), |_| {
-                ready(Err::<String, _>("provider failed"))
-            })
-            .await;
-
-        assert_eq!(result.unwrap_err(), "provider failed");
-        assert_eq!(conversation.messages().len(), 1);
-        assert_eq!(conversation.messages()[0].role(), MessageRole::User);
-        assert_eq!(conversation.messages()[0].content(), "Will this fail?");
+    fn completion() -> Completion {
+        Completion {
+            provider_response_id: Some("resp_test".to_owned()),
+            input_tokens: 1,
+            output_tokens: 1,
+        }
     }
 }

@@ -108,29 +108,28 @@ async fn try_main() -> Result<(), AppError> {
         Command::Chat { agent: agent_name } => {
             let config = Config::load(Path::new(CONFIG_PATH))?;
             let agent = config.agent(&agent_name)?;
+            let client = OpenAiClient::from_config(config.openai())?;
             let snapshot = AgentSnapshot::resolve(agent, config.openai());
             let store = Store::open(DATABASE_PATH).await?;
             let session = store.create_session(snapshot).await?;
-            let client = client_for_session(&session)?;
             let input = BufReader::new(tokio::io::stdin());
             let stdout = io::stdout();
             let mut output = stdout.lock();
             writeln!(output, "Session {}", session.id())?;
+            writeln!(output, "{}> ready", session.agent().agent_name())?;
             run_chat(Conversation::new(store, session), &client, input, output).await?;
         }
         Command::Attach { session: id } => {
             let store = Store::open(DATABASE_PATH).await?;
             let session = store.load_session(&id).await?;
+            let messages = store.history(&id).await?;
             let client = client_for_session(&session)?;
             let input = BufReader::new(tokio::io::stdin());
             let stdout = io::stdout();
-            run_chat(
-                Conversation::new(store, session),
-                &client,
-                input,
-                stdout.lock(),
-            )
-            .await?;
+            let mut output = stdout.lock();
+            writeln!(output, "Session {}", session.id())?;
+            write_history(session.agent().agent_name(), &messages, &mut output)?;
+            run_chat(Conversation::new(store, session), &client, input, output).await?;
         }
         Command::History { session: id } => {
             let store = Store::open(DATABASE_PATH).await?;
@@ -172,7 +171,6 @@ async fn run_chat(
     mut output: impl Write,
 ) -> Result<(), AppError> {
     let agent = conversation.session().agent();
-    writeln!(output, "{}> ready", agent.agent_name())?;
 
     loop {
         let input_action = tokio::select! {
