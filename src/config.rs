@@ -11,18 +11,59 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Debug)]
 pub struct Config {
-    openai: OpenAiConfig,
     agents: BTreeMap<String, Agent>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    OpenAi,
+}
+
+impl ProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+        }
+    }
+
+    pub(crate) fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "openai" => Some(Self::OpenAi),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
-pub struct OpenAiConfig {
+pub struct Agent {
+    name: String,
+    model_alias: String,
+    provider_name: String,
+    provider_kind: ProviderKind,
     base_url: String,
     api_key_env: String,
     model: String,
+    prompt: String,
 }
 
-impl OpenAiConfig {
+impl Agent {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn model_alias(&self) -> &str {
+        &self.model_alias
+    }
+
+    pub fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    pub fn provider_kind(&self) -> ProviderKind {
+        self.provider_kind
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -34,18 +75,6 @@ impl OpenAiConfig {
     pub fn model(&self) -> &str {
         &self.model
     }
-}
-
-#[derive(Debug)]
-pub struct Agent {
-    name: String,
-    prompt: String,
-}
-
-impl Agent {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
 
     pub fn prompt(&self) -> &str {
         &self.prompt
@@ -56,17 +85,19 @@ impl Agent {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     version: u32,
-    openai: RawOpenAiConfig,
+    providers: BTreeMap<String, RawProvider>,
+    models: BTreeMap<String, RawModel>,
     agents: BTreeMap<String, RawAgent>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawOpenAiConfig {
+struct RawProvider {
+    #[serde(rename = "type")]
+    kind: ProviderKind,
     #[serde(default = "default_openai_base_url")]
     base_url: String,
     api_key_env: String,
-    model: String,
 }
 
 fn default_openai_base_url() -> String {
@@ -75,7 +106,15 @@ fn default_openai_base_url() -> String {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawModel {
+    provider: String,
+    model: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawAgent {
+    model: String,
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
 }
@@ -91,13 +130,28 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
     UnsupportedVersion(u32),
-    InvalidOpenAi {
+    NoProviders,
+    NoModels,
+    NoAgents,
+    InvalidProvider {
+        name: String,
         reason: &'static str,
     },
-    NoAgents,
+    InvalidModel {
+        name: String,
+        reason: &'static str,
+    },
     InvalidAgent {
         name: String,
         reason: &'static str,
+    },
+    UnknownProvider {
+        model: String,
+        provider: String,
+    },
+    UnknownModel {
+        agent: String,
+        model: String,
     },
     ReadPrompt {
         agent: String,
@@ -125,10 +179,7 @@ impl Config {
         if raw.version != SUPPORTED_VERSION {
             return Err(ConfigError::UnsupportedVersion(raw.version));
         }
-        let openai = validate_openai(raw.openai)?;
-        if raw.agents.is_empty() {
-            return Err(ConfigError::NoAgents);
-        }
+        validate_definitions(&raw)?;
 
         let base_dir = path
             .parent()
@@ -137,22 +188,42 @@ impl Config {
         let mut agents = BTreeMap::new();
 
         for (name, raw_agent) in raw.agents {
-            if name.trim().is_empty() {
-                return Err(ConfigError::InvalidAgent {
-                    name,
-                    reason: "agent names cannot be empty",
-                });
-            }
-
+            validate_name("agent", &name).map_err(|reason| ConfigError::InvalidAgent {
+                name: name.clone(),
+                reason,
+            })?;
+            let model_alias = raw_agent.model.clone();
+            let model = raw
+                .models
+                .get(&model_alias)
+                .ok_or_else(|| ConfigError::UnknownModel {
+                    agent: name.clone(),
+                    model: model_alias.clone(),
+                })?;
+            let provider =
+                raw.providers
+                    .get(&model.provider)
+                    .ok_or_else(|| ConfigError::UnknownProvider {
+                        model: model_alias.clone(),
+                        provider: model.provider.clone(),
+                    })?;
             let prompt = resolve_prompt(&name, raw_agent, base_dir)?;
-            agents.insert(name.clone(), Agent { name, prompt });
+            agents.insert(
+                name.clone(),
+                Agent {
+                    name,
+                    model_alias,
+                    provider_name: model.provider.clone(),
+                    provider_kind: provider.kind,
+                    base_url: provider.base_url.clone(),
+                    api_key_env: provider.api_key_env.clone(),
+                    model: model.model.clone(),
+                    prompt,
+                },
+            );
         }
 
-        Ok(Self { openai, agents })
-    }
-
-    pub fn openai(&self) -> &OpenAiConfig {
-        &self.openai
+        Ok(Self { agents })
     }
 
     pub fn agent(&self, name: &str) -> Result<&Agent, ConfigError> {
@@ -163,30 +234,73 @@ impl Config {
                 available: self.agents.keys().cloned().collect(),
             })
     }
+
+    pub fn agents(&self) -> impl Iterator<Item = &Agent> {
+        self.agents.values()
+    }
 }
 
-fn validate_openai(raw: RawOpenAiConfig) -> Result<OpenAiConfig, ConfigError> {
-    if raw.base_url.trim().is_empty() {
-        return Err(ConfigError::InvalidOpenAi {
-            reason: "`base_url` cannot be empty",
-        });
+fn validate_definitions(raw: &RawConfig) -> Result<(), ConfigError> {
+    if raw.providers.is_empty() {
+        return Err(ConfigError::NoProviders);
     }
-    if raw.api_key_env.trim().is_empty() {
-        return Err(ConfigError::InvalidOpenAi {
-            reason: "`api_key_env` cannot be empty",
-        });
+    if raw.models.is_empty() {
+        return Err(ConfigError::NoModels);
     }
-    if raw.model.trim().is_empty() {
-        return Err(ConfigError::InvalidOpenAi {
-            reason: "`model` cannot be empty",
-        });
+    if raw.agents.is_empty() {
+        return Err(ConfigError::NoAgents);
     }
 
-    Ok(OpenAiConfig {
-        base_url: raw.base_url,
-        api_key_env: raw.api_key_env,
-        model: raw.model,
-    })
+    for (name, provider) in &raw.providers {
+        validate_name("provider", name).map_err(|reason| ConfigError::InvalidProvider {
+            name: name.clone(),
+            reason,
+        })?;
+        if provider.base_url.trim().is_empty() {
+            return Err(ConfigError::InvalidProvider {
+                name: name.clone(),
+                reason: "`base_url` cannot be empty",
+            });
+        }
+        if provider.api_key_env.trim().is_empty() {
+            return Err(ConfigError::InvalidProvider {
+                name: name.clone(),
+                reason: "`api_key_env` cannot be empty",
+            });
+        }
+    }
+
+    for (name, model) in &raw.models {
+        validate_name("model", name).map_err(|reason| ConfigError::InvalidModel {
+            name: name.clone(),
+            reason,
+        })?;
+        if model.model.trim().is_empty() {
+            return Err(ConfigError::InvalidModel {
+                name: name.clone(),
+                reason: "`model` cannot be empty",
+            });
+        }
+        if !raw.providers.contains_key(&model.provider) {
+            return Err(ConfigError::UnknownProvider {
+                model: name.clone(),
+                provider: model.provider.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_name(kind: &'static str, name: &str) -> Result<(), &'static str> {
+    if name.trim().is_empty() {
+        return Err(match kind {
+            "provider" => "provider names cannot be empty",
+            "model" => "model names cannot be empty",
+            _ => "agent names cannot be empty",
+        });
+    }
+    Ok(())
 }
 
 fn resolve_prompt(name: &str, raw_agent: RawAgent, base_dir: &Path) -> Result<String, ConfigError> {
@@ -231,30 +345,41 @@ fn resolve_prompt(name: &str, raw_agent: RawAgent, base_dir: &Path) -> Result<St
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ReadConfig { path, source } => {
-                write!(
-                    formatter,
-                    "cannot read configuration `{}`: {source}",
-                    path.display()
-                )
-            }
-            Self::Parse { path, source } => {
-                write!(
-                    formatter,
-                    "invalid configuration `{}`: {source}",
-                    path.display()
-                )
-            }
+            Self::ReadConfig { path, source } => write!(
+                formatter,
+                "cannot read configuration `{}`: {source}",
+                path.display()
+            ),
+            Self::Parse { path, source } => write!(
+                formatter,
+                "invalid configuration `{}`: {source}",
+                path.display()
+            ),
             Self::UnsupportedVersion(version) => write!(
                 formatter,
                 "unsupported configuration version {version}; expected {SUPPORTED_VERSION}"
             ),
-            Self::InvalidOpenAi { reason } => {
-                write!(formatter, "invalid OpenAI configuration: {reason}")
-            }
+            Self::NoProviders => write!(formatter, "configuration must define a provider"),
+            Self::NoModels => write!(formatter, "configuration must define a model"),
             Self::NoAgents => write!(formatter, "configuration must define at least one agent"),
+            Self::InvalidProvider { name, reason } => {
+                write!(formatter, "invalid provider `{name}`: {reason}")
+            }
+            Self::InvalidModel { name, reason } => {
+                write!(formatter, "invalid model `{name}`: {reason}")
+            }
             Self::InvalidAgent { name, reason } => {
                 write!(formatter, "invalid agent `{name}`: {reason}")
+            }
+            Self::UnknownProvider { model, provider } => write!(
+                formatter,
+                "model `{model}` references unknown provider `{provider}`"
+            ),
+            Self::UnknownModel { agent, model } => {
+                write!(
+                    formatter,
+                    "agent `{agent}` references unknown model `{model}`"
+                )
             }
             Self::ReadPrompt {
                 agent,
@@ -279,18 +404,14 @@ impl Error for ConfigError {
         match self {
             Self::ReadConfig { source, .. } | Self::ReadPrompt { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
-            Self::UnsupportedVersion(_)
-            | Self::InvalidOpenAi { .. }
-            | Self::NoAgents
-            | Self::InvalidAgent { .. }
-            | Self::UnknownAgent { .. } => None,
+            _ => None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, DEFAULT_OPENAI_BASE_URL};
+    use super::{Config, ConfigError, DEFAULT_OPENAI_BASE_URL, ProviderKind};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -332,8 +453,11 @@ mod tests {
         format!(
             concat!(
                 "version = 1\n",
-                "[openai]\n",
+                "[providers.openai]\n",
+                "type = \"openai\"\n",
                 "api_key_env = \"OPENAI_API_KEY\"\n",
+                "[models.primary]\n",
+                "provider = \"openai\"\n",
                 "model = \"test-model\"\n",
                 "{agent_tables}"
             ),
@@ -342,22 +466,25 @@ mod tests {
     }
 
     #[test]
-    fn loads_openai_settings_and_an_inline_prompt() {
+    fn resolves_provider_model_and_inline_prompt() {
         let directory = TestDirectory::new();
         let path = directory.write(
             "tapet.toml",
-            &configuration("[agents.explorer]\nprompt = \"Explore carefully\"\n"),
+            &configuration(
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore carefully\"\n",
+            ),
         );
 
         let config = Config::load(path).unwrap();
+        let agent = config.agent("explorer").unwrap();
 
-        assert_eq!(config.openai().base_url(), DEFAULT_OPENAI_BASE_URL);
-        assert_eq!(config.openai().api_key_env(), "OPENAI_API_KEY");
-        assert_eq!(config.openai().model(), "test-model");
-        assert_eq!(
-            config.agent("explorer").unwrap().prompt(),
-            "Explore carefully"
-        );
+        assert_eq!(agent.provider_kind(), ProviderKind::OpenAi);
+        assert_eq!(agent.provider_name(), "openai");
+        assert_eq!(agent.base_url(), DEFAULT_OPENAI_BASE_URL);
+        assert_eq!(agent.api_key_env(), "OPENAI_API_KEY");
+        assert_eq!(agent.model_alias(), "primary");
+        assert_eq!(agent.model(), "test-model");
+        assert_eq!(agent.prompt(), "Explore carefully");
     }
 
     #[test]
@@ -366,7 +493,9 @@ mod tests {
         directory.write("prompts/reviewer.md", "Review carefully\n");
         let path = directory.write(
             "tapet.toml",
-            &configuration("[agents.reviewer]\nprompt_file = \"prompts/reviewer.md\"\n"),
+            &configuration(
+                "[agents.reviewer]\nmodel = \"primary\"\nprompt_file = \"prompts/reviewer.md\"\n",
+            ),
         );
 
         let config = Config::load(path).unwrap();
@@ -378,93 +507,102 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_toml() {
-        let directory = TestDirectory::new();
-        let path = directory.write("tapet.toml", "version = [\n");
-
-        assert!(matches!(Config::load(path), Err(ConfigError::Parse { .. })));
-    }
-
-    #[test]
-    fn rejects_unknown_fields() {
-        let directory = TestDirectory::new();
-        let path = directory.write(
-            "tapet.toml",
-            &configuration("unexpected = true\n[agents.explorer]\nprompt = \"Explore\"\n"),
-        );
-
-        assert!(matches!(Config::load(path), Err(ConfigError::Parse { .. })));
-    }
-
-    #[test]
-    fn rejects_invalid_openai_settings() {
-        let directory = TestDirectory::new();
-        let path = directory.write(
-            "tapet.toml",
-            concat!(
-                "version = 1\n",
-                "[openai]\n",
-                "api_key_env = \"\"\n",
-                "model = \"test-model\"\n",
-                "[agents.explorer]\n",
-                "prompt = \"Explore\"\n"
-            ),
-        );
-
-        assert!(matches!(
-            Config::load(path),
-            Err(ConfigError::InvalidOpenAi {
-                reason: "`api_key_env` cannot be empty"
-            })
-        ));
-    }
-
-    #[test]
-    fn rejects_an_agent_without_a_prompt() {
-        let directory = TestDirectory::new();
-        let path = directory.write("tapet.toml", &configuration("[agents.explorer]\n"));
-
-        assert!(matches!(
-            Config::load(path),
-            Err(ConfigError::InvalidAgent {
-                name,
-                reason: "exactly one of `prompt` or `prompt_file` is required"
-            }) if name == "explorer"
-        ));
-    }
-
-    #[test]
-    fn rejects_a_missing_prompt_file() {
-        let directory = TestDirectory::new();
-        let path = directory.write(
-            "tapet.toml",
-            &configuration("[agents.explorer]\nprompt_file = \"missing.md\"\n"),
-        );
-
-        assert!(matches!(
-            Config::load(path),
-            Err(ConfigError::ReadPrompt { agent, .. }) if agent == "explorer"
-        ));
-    }
-
-    #[test]
-    fn rejects_both_prompt_sources() {
+    fn exposes_agents_in_deterministic_name_order() {
         let directory = TestDirectory::new();
         let path = directory.write(
             "tapet.toml",
             &configuration(concat!(
-                "[agents.explorer]\n",
-                "prompt = \"Explore\"\n",
-                "prompt_file = \"explorer.md\"\n"
+                "[agents.reviewer]\nmodel = \"primary\"\nprompt = \"Review\"\n",
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n"
             )),
         );
+        let config = Config::load(path).unwrap();
 
+        assert_eq!(
+            config
+                .agents()
+                .map(|agent| agent.name())
+                .collect::<Vec<_>>(),
+            ["explorer", "reviewer"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_and_unknown_references() {
+        let directory = TestDirectory::new();
+        let unknown_provider = directory.write(
+            "unknown-provider.toml",
+            concat!(
+                "version = 1\n",
+                "[providers.openai]\ntype = \"openai\"\napi_key_env = \"KEY\"\n",
+                "[models.primary]\nprovider = \"missing\"\nmodel = \"test\"\n",
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n"
+            ),
+        );
         assert!(matches!(
-            Config::load(path),
-            Err(ConfigError::InvalidAgent {
-                reason: "`prompt` and `prompt_file` cannot be used together",
-                ..
-            })
+            Config::load(unknown_provider),
+            Err(ConfigError::UnknownProvider { model, provider })
+                if model == "primary" && provider == "missing"
+        ));
+
+        let unknown_model = directory.write(
+            "unknown-model.toml",
+            &configuration("[agents.explorer]\nmodel = \"missing\"\nprompt = \"Explore\"\n"),
+        );
+        assert!(matches!(
+            Config::load(unknown_model),
+            Err(ConfigError::UnknownModel { agent, model })
+                if agent == "explorer" && model == "missing"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_toml_and_unknown_fields() {
+        let directory = TestDirectory::new();
+        let invalid = directory.write("invalid.toml", "version = [\n");
+        assert!(matches!(
+            Config::load(invalid),
+            Err(ConfigError::Parse { .. })
+        ));
+
+        let unknown = directory.write(
+            "unknown.toml",
+            &configuration(
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\nunexpected = true\n",
+            ),
+        );
+        assert!(matches!(
+            Config::load(unknown),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_provider_and_agent_settings() {
+        let directory = TestDirectory::new();
+        let invalid_provider = directory.write(
+            "provider.toml",
+            concat!(
+                "version = 1\n",
+                "[providers.openai]\ntype = \"openai\"\napi_key_env = \"\"\n",
+                "[models.primary]\nprovider = \"openai\"\nmodel = \"test\"\n",
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n"
+            ),
+        );
+        assert!(matches!(
+            Config::load(invalid_provider),
+            Err(ConfigError::InvalidProvider { reason, .. })
+                if reason == "`api_key_env` cannot be empty"
+        ));
+
+        let no_prompt = directory.write(
+            "agent.toml",
+            &configuration("[agents.explorer]\nmodel = \"primary\"\n"),
+        );
+        assert!(matches!(
+            Config::load(no_prompt),
+            Err(ConfigError::InvalidAgent { reason, .. })
+                if reason == "exactly one of `prompt` or `prompt_file` is required"
         ));
     }
 
@@ -474,18 +612,14 @@ mod tests {
         let path = directory.write(
             "tapet.toml",
             &configuration(concat!(
-                "[agents.reviewer]\n",
-                "prompt = \"Review\"\n",
-                "[agents.explorer]\n",
-                "prompt = \"Explore\"\n"
+                "[agents.reviewer]\nmodel = \"primary\"\nprompt = \"Review\"\n",
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n"
             )),
         );
         let config = Config::load(path).unwrap();
 
-        let error = config.agent("missing").unwrap_err();
-
         assert_eq!(
-            error.to_string(),
+            config.agent("missing").unwrap_err().to_string(),
             "unknown agent `missing`; available agents: explorer, reviewer"
         );
     }

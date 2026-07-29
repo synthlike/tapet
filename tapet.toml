@@ -1,9 +1,17 @@
 version = 1
 
-[openai]
+[providers.openai]
+type = "openai"
 api_key_env = "OPENAI_API_KEY"
+
+[models.gpt-sol]
+provider = "openai"
 model = "gpt-5.6-sol"
 
 [agents.explorer]
-# prompt = "Explore the world and beyond. Make no mistakes."
+model = "gpt-sol"
+prompt = "Explore the world and beyond. Make no mistakes."
+
+[agents.shouter]
+model = "gpt-sol"
 prompt = "Respond always in all caps"

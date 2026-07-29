@@ -1,3 +1,4 @@
+use crate::config::ProviderKind;
 use crate::message::Message;
 use crate::session::{AgentSnapshot, Session, SessionId};
 use crate::stream::Completion;
@@ -74,10 +75,11 @@ impl Store {
                     "INSERT INTO sessions (
                         id, agent_name, provider_kind, base_url, api_key_env, model,
                         system_prompt, created_at, updated_at
-                     ) VALUES (?1, ?2, 'openai', ?3, ?4, ?5, ?6, ?7, ?7)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                     params![
                         stored_id,
                         stored_agent.agent_name(),
+                        stored_agent.provider_kind().as_str(),
                         stored_agent.base_url(),
                         stored_agent.api_key_env(),
                         stored_agent.model(),
@@ -99,16 +101,20 @@ impl Store {
             .call(move |connection| {
                 connection
                     .query_row(
-                        "SELECT agent_name, base_url, api_key_env, model, system_prompt
+                        "SELECT agent_name, provider_kind, base_url, api_key_env, model, system_prompt
                          FROM sessions WHERE id = ?1",
                         [stored_id],
                         |row| {
+                            let stored_kind: String = row.get(1)?;
+                            let provider_kind = ProviderKind::from_stored(&stored_kind)
+                                .ok_or(rusqlite::Error::InvalidQuery)?;
                             Ok(AgentSnapshot::from_stored(
                                 row.get(0)?,
-                                row.get(1)?,
+                                provider_kind,
                                 row.get(2)?,
                                 row.get(3)?,
                                 row.get(4)?,
+                                row.get(5)?,
                             ))
                         },
                     )
@@ -127,6 +133,28 @@ impl Store {
             .call(move |connection| query_messages(connection, &stored_id))
             .await?;
         Ok(messages)
+    }
+
+    pub async fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
+        Ok(self
+            .connection
+            .call(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT id, agent_name, model, updated_at
+                     FROM sessions ORDER BY updated_at DESC, id ASC",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok(SessionSummary {
+                            id: row.get(0)?,
+                            agent_name: row.get(1)?,
+                            model: row.get(2)?,
+                            updated_at_ms: row.get(3)?,
+                        })
+                    })?
+                    .collect()
+            })
+            .await?)
     }
 
     pub(crate) async fn begin_call(
@@ -289,6 +317,44 @@ impl Store {
 pub(crate) struct BegunCall {
     pub call_id: i64,
     pub messages: Vec<Message>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSummary {
+    id: String,
+    agent_name: String,
+    model: String,
+    updated_at_ms: i64,
+}
+
+impl SessionSummary {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn updated_at_ms(&self) -> i64 {
+        self.updated_at_ms
+    }
+}
+
+#[cfg(test)]
+impl SessionSummary {
+    pub fn fixture(id: &str, agent_name: &str, model: &str, updated_at_ms: i64) -> Self {
+        Self {
+            id: id.to_owned(),
+            agent_name: agent_name.to_owned(),
+            model: model.to_owned(),
+            updated_at_ms,
+        }
+    }
 }
 
 fn query_messages(
@@ -526,5 +592,143 @@ mod tests {
         assert!(foreign_keys);
         assert_eq!(busy_timeout, 5_000);
         assert_eq!(user_version, 1);
+    }
+
+    #[tokio::test]
+    async fn lists_sessions_by_updated_time_with_stable_ties() {
+        let temporary = TempDir::new().unwrap();
+        let store = Store::open(temporary.path().join("tapet.db"))
+            .await
+            .unwrap();
+        let explorer = store
+            .create_session(AgentSnapshot::fixture_for(
+                "explorer",
+                "fast-model",
+                "Explore",
+            ))
+            .await
+            .unwrap();
+        let reviewer = store
+            .create_session(AgentSnapshot::fixture_for(
+                "reviewer",
+                "deep-model",
+                "Review",
+            ))
+            .await
+            .unwrap();
+        let explorer_id = explorer.id().to_string();
+        let reviewer_id = reviewer.id().to_string();
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET updated_at = 100 WHERE id = ?1",
+                    [explorer_id],
+                )?;
+                connection.execute(
+                    "UPDATE sessions SET updated_at = 200 WHERE id = ?1",
+                    [reviewer_id],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let sessions = store.sessions().await.unwrap();
+
+        assert_eq!(sessions[0].id(), reviewer.id().to_string());
+        assert_eq!(sessions[0].agent_name(), "reviewer");
+        assert_eq!(sessions[0].model(), "deep-model");
+        assert_eq!(sessions[0].updated_at_ms(), 200);
+        assert_eq!(sessions[1].id(), explorer.id().to_string());
+    }
+
+    #[tokio::test]
+    async fn independent_agents_can_turn_concurrently_without_history_leaks() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("tapet.db");
+        let setup = Store::open(&path).await.unwrap();
+        let explorer = setup
+            .create_session(AgentSnapshot::fixture_for(
+                "explorer",
+                "fast-model",
+                "Explore",
+            ))
+            .await
+            .unwrap();
+        let reviewer = setup
+            .create_session(AgentSnapshot::fixture_for(
+                "reviewer",
+                "deep-model",
+                "Review",
+            ))
+            .await
+            .unwrap();
+        let explorer_store = Store::open(&path).await.unwrap();
+        let reviewer_store = Store::open(&path).await.unwrap();
+
+        let (explorer_call, reviewer_call) = tokio::join!(
+            explorer_store.begin_call(explorer.id(), "Explore this".to_owned()),
+            reviewer_store.begin_call(reviewer.id(), "Review this".to_owned())
+        );
+        let explorer_call = explorer_call.unwrap();
+        let reviewer_call = reviewer_call.unwrap();
+
+        assert_eq!(explorer_call.messages, [Message::user("Explore this")]);
+        assert_eq!(reviewer_call.messages, [Message::user("Review this")]);
+        explorer_store
+            .complete_call(
+                explorer_call.call_id,
+                "Explored".to_owned(),
+                completion("resp_explorer"),
+            )
+            .await
+            .unwrap();
+        reviewer_store
+            .complete_call(
+                reviewer_call.call_id,
+                "Reviewed".to_owned(),
+                completion("resp_reviewer"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            explorer_store.history(explorer.id()).await.unwrap(),
+            [
+                Message::user("Explore this"),
+                Message::assistant("Explored")
+            ]
+        );
+        assert_eq!(
+            reviewer_store.history(reviewer.id()).await.unwrap(),
+            [Message::user("Review this"), Message::assistant("Reviewed")]
+        );
+        assert_eq!(
+            explorer_store
+                .load_session(explorer.id())
+                .await
+                .unwrap()
+                .agent()
+                .model(),
+            "fast-model"
+        );
+        assert_eq!(
+            reviewer_store
+                .load_session(reviewer.id())
+                .await
+                .unwrap()
+                .agent()
+                .model(),
+            "deep-model"
+        );
+    }
+
+    fn completion(response_id: &str) -> Completion {
+        Completion {
+            provider_response_id: Some(response_id.to_owned()),
+            input_tokens: 1,
+            output_tokens: 1,
+        }
     }
 }

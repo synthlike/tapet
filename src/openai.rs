@@ -1,4 +1,4 @@
-use crate::config::OpenAiConfig;
+use crate::config::Agent;
 use crate::message::Message;
 use crate::stream::{Completion, StreamEvent};
 use eventsource_stream::{Event, Eventsource};
@@ -18,8 +18,8 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    pub fn from_config(config: &OpenAiConfig) -> Result<Self, ProviderError> {
-        Self::from_settings(config.base_url(), config.api_key_env(), config.model())
+    pub fn from_agent(agent: &Agent) -> Result<Self, ProviderError> {
+        Self::from_settings(agent.base_url(), agent.api_key_env(), agent.model())
     }
 
     pub fn from_settings(

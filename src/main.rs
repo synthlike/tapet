@@ -7,7 +7,7 @@ mod store;
 mod stream;
 mod terminal;
 
-use config::{Config, ConfigError};
+use config::{Agent, Config, ConfigError};
 use conversation::Conversation;
 use futures_util::{Stream, StreamExt};
 use message::{Message, MessageRole};
@@ -18,10 +18,11 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
-use store::{Store, StoreError};
+use store::{SessionSummary, Store, StoreError};
 use stream::{Completion, StreamEvent};
 use terminal::InputSuppression;
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 const CONFIG_PATH: &str = "tapet.toml";
@@ -29,6 +30,8 @@ const DATABASE_PATH: &str = ".tapet/tapet.db";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
+    Agents,
+    Sessions,
     Ask { agent: String, message: String },
     Chat { agent: String },
     Attach { session: SessionId },
@@ -43,6 +46,18 @@ fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command,
         .map_err(|_| AppError::Usage)?;
 
     match subcommand.as_str() {
+        "agents" => {
+            if args.next().is_some() {
+                return Err(AppError::Usage);
+            }
+            Ok(Command::Agents)
+        }
+        "sessions" => {
+            if args.next().is_some() {
+                return Err(AppError::Usage);
+            }
+            Ok(Command::Sessions)
+        }
         "ask" => {
             let agent = next_argument(&mut args)?;
             let message = next_argument(&mut args)?;
@@ -87,13 +102,24 @@ async fn try_main() -> Result<(), AppError> {
     let command = selected_command(env::args_os().skip(1))?;
 
     match command {
+        Command::Agents => {
+            let config = Config::load(Path::new(CONFIG_PATH))?;
+            let stdout = io::stdout();
+            write_agents(config.agents(), &mut stdout.lock())?;
+        }
+        Command::Sessions => {
+            let store = Store::open(DATABASE_PATH).await?;
+            let sessions = store.sessions().await?;
+            let stdout = io::stdout();
+            write_sessions(&sessions, &mut stdout.lock())?;
+        }
         Command::Ask {
             agent: agent_name,
             message,
         } => {
             let config = Config::load(Path::new(CONFIG_PATH))?;
             let agent = config.agent(&agent_name)?;
-            let client = OpenAiClient::from_config(config.openai())?;
+            let client = OpenAiClient::from_agent(agent)?;
             let messages = [Message::user(message)];
             let stdout = io::stdout();
             render_response(
@@ -108,8 +134,8 @@ async fn try_main() -> Result<(), AppError> {
         Command::Chat { agent: agent_name } => {
             let config = Config::load(Path::new(CONFIG_PATH))?;
             let agent = config.agent(&agent_name)?;
-            let client = OpenAiClient::from_config(config.openai())?;
-            let snapshot = AgentSnapshot::resolve(agent, config.openai());
+            let client = OpenAiClient::from_agent(agent)?;
+            let snapshot = AgentSnapshot::resolve(agent);
             let store = Store::open(DATABASE_PATH).await?;
             let session = store.create_session(snapshot).await?;
             let input = BufReader::new(tokio::io::stdin());
@@ -147,6 +173,45 @@ async fn try_main() -> Result<(), AppError> {
 fn client_for_session(session: &session::Session) -> Result<OpenAiClient, ProviderError> {
     let agent = session.agent();
     OpenAiClient::from_settings(agent.base_url(), agent.api_key_env(), agent.model())
+}
+
+fn write_agents<'a>(
+    agents: impl Iterator<Item = &'a Agent>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    for agent in agents {
+        writeln!(
+            output,
+            "{}\t{}\t{}\t{}",
+            agent.name(),
+            agent.model_alias(),
+            agent.provider_name(),
+            agent.model()
+        )?;
+    }
+    Ok(())
+}
+
+fn write_sessions(sessions: &[SessionSummary], output: &mut impl Write) -> io::Result<()> {
+    for session in sessions {
+        let updated_at = format_timestamp(session.updated_at_ms())?;
+        writeln!(
+            output,
+            "{}\t{}\t{}\t{}",
+            session.id(),
+            session.agent_name(),
+            session.model(),
+            updated_at
+        )?;
+    }
+    Ok(())
+}
+
+fn format_timestamp(millis: i64) -> io::Result<String> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        .format(&Rfc3339)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn write_history(
@@ -324,7 +389,7 @@ async fn main() {
 #[derive(Debug, Error)]
 enum AppError {
     #[error(
-        "usage: tapet ask <agent> <message>\n       tapet chat <agent>\n       tapet attach <session>\n       tapet history <session>"
+        "usage: tapet agents\n       tapet sessions\n       tapet ask <agent> <message>\n       tapet chat <agent>\n       tapet attach <session>\n       tapet history <session>"
     )]
     Usage,
     #[error(transparent)]
@@ -342,16 +407,33 @@ enum AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, UserInput, read_user_input, render_events, selected_command, write_history,
+        Command, UserInput, read_user_input, render_events, selected_command, write_agents,
+        write_history, write_sessions,
     };
+    use crate::config::Config;
     use crate::message::Message;
     use crate::openai::{ProviderError, decode_stream};
     use crate::session::SessionId;
+    use crate::store::SessionSummary;
     use crate::stream::{Completion, StreamEvent};
     use futures_util::stream;
     use std::ffi::OsString;
+    use std::fs;
     use std::io::{self, Write};
+    use tempfile::TempDir;
     use tokio::io::BufReader;
+
+    #[test]
+    fn parses_listing_commands() {
+        assert_eq!(
+            selected_command([OsString::from("agents")].into_iter()).unwrap(),
+            Command::Agents
+        );
+        assert_eq!(
+            selected_command([OsString::from("sessions")].into_iter()).unwrap(),
+            Command::Sessions
+        );
+    }
 
     #[test]
     fn parses_ask_and_chat_commands() {
@@ -401,6 +483,10 @@ mod tests {
         assert!(selected_command(std::iter::empty()).is_err());
         assert!(selected_command([OsString::from("ask")].into_iter()).is_err());
         assert!(selected_command([OsString::from("chat")].into_iter()).is_err());
+        assert!(
+            selected_command([OsString::from("agents"), OsString::from("extra")].into_iter())
+                .is_err()
+        );
         assert!(
             selected_command(
                 [OsString::from("attach"), OsString::from("not-a-session")].into_iter()
@@ -468,6 +554,54 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "you> Hello\nexplorer> Hi\n"
+        );
+    }
+
+    #[test]
+    fn agent_listing_has_stable_tab_separated_output() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("tapet.toml");
+        fs::write(
+            &path,
+            concat!(
+                "version = 1\n",
+                "[providers.openai]\ntype = \"openai\"\napi_key_env = \"KEY\"\n",
+                "[models.primary]\nprovider = \"openai\"\nmodel = \"gpt-test\"\n",
+                "[agents.reviewer]\nmodel = \"primary\"\nprompt = \"Review\"\n",
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n"
+            ),
+        )
+        .unwrap();
+        let config = Config::load(path).unwrap();
+        let mut output = Vec::new();
+
+        write_agents(config.agents(), &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "explorer\tprimary\topenai\tgpt-test\n",
+                "reviewer\tprimary\topenai\tgpt-test\n"
+            )
+        );
+    }
+
+    #[test]
+    fn session_listing_has_stable_tab_separated_output() {
+        let sessions = [
+            SessionSummary::fixture("ses_new", "reviewer", "deep-model", 1_700_000_000_000),
+            SessionSummary::fixture("ses_old", "explorer", "fast-model", 1_600_000_000_000),
+        ];
+        let mut output = Vec::new();
+
+        write_sessions(&sessions, &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "ses_new\treviewer\tdeep-model\t2023-11-14T22:13:20Z\n",
+                "ses_old\texplorer\tfast-model\t2020-09-13T12:26:40Z\n"
+            )
         );
     }
 

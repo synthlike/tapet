@@ -1,4 +1,4 @@
-use crate::config::{Agent, OpenAiConfig};
+use crate::config::{Agent, ProviderKind};
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
@@ -41,6 +41,7 @@ pub struct SessionIdError(String);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentSnapshot {
     agent_name: String,
+    provider_kind: ProviderKind,
     base_url: String,
     api_key_env: String,
     model: String,
@@ -48,18 +49,23 @@ pub struct AgentSnapshot {
 }
 
 impl AgentSnapshot {
-    pub fn resolve(agent: &Agent, openai: &OpenAiConfig) -> Self {
+    pub fn resolve(agent: &Agent) -> Self {
         Self {
             agent_name: agent.name().to_owned(),
-            base_url: openai.base_url().to_owned(),
-            api_key_env: openai.api_key_env().to_owned(),
-            model: openai.model().to_owned(),
+            provider_kind: agent.provider_kind(),
+            base_url: agent.base_url().to_owned(),
+            api_key_env: agent.api_key_env().to_owned(),
+            model: agent.model().to_owned(),
             system_prompt: agent.prompt().to_owned(),
         }
     }
 
     pub fn agent_name(&self) -> &str {
         &self.agent_name
+    }
+
+    pub fn provider_kind(&self) -> ProviderKind {
+        self.provider_kind
     }
 
     pub fn base_url(&self) -> &str {
@@ -80,6 +86,7 @@ impl AgentSnapshot {
 
     pub(crate) fn from_stored(
         agent_name: String,
+        provider_kind: ProviderKind,
         base_url: String,
         api_key_env: String,
         model: String,
@@ -87,6 +94,7 @@ impl AgentSnapshot {
     ) -> Self {
         Self {
             agent_name,
+            provider_kind,
             base_url,
             api_key_env,
             model,
@@ -118,11 +126,16 @@ impl Session {
 #[cfg(test)]
 impl AgentSnapshot {
     pub fn fixture(prompt: &str) -> Self {
+        Self::fixture_for("explorer", "test-model", prompt)
+    }
+
+    pub fn fixture_for(agent_name: &str, model: &str, prompt: &str) -> Self {
         Self {
-            agent_name: "explorer".to_owned(),
+            agent_name: agent_name.to_owned(),
+            provider_kind: ProviderKind::OpenAi,
             base_url: "https://example.test/v1".to_owned(),
             api_key_env: "TEST_OPENAI_API_KEY".to_owned(),
-            model: "test-model".to_owned(),
+            model: model.to_owned(),
             system_prompt: prompt.to_owned(),
         }
     }
