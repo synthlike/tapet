@@ -28,10 +28,7 @@ impl Message {
         }
     }
 
-    pub fn role(&self) -> MessageRole {
-        self.role
-    }
-
+    #[cfg(test)]
     pub fn content(&self) -> &str {
         &self.content
     }

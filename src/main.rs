@@ -1,28 +1,30 @@
+mod agent;
 mod config;
-mod conversation;
 mod message;
 mod openai;
-mod session;
+mod room;
 mod store;
 mod stream;
 mod terminal;
 
+use agent::AgentSnapshot;
 use config::{Agent, Config, ConfigError};
-use conversation::Conversation;
 use futures_util::{Stream, StreamExt};
-use message::{Message, MessageRole};
+use message::Message;
 use openai::{OpenAiClient, ProviderError};
-use session::{AgentSnapshot, SessionId, SessionIdError};
+use room::{
+    Room, RoomError, RoomId, RoomIdError, RoomMessage, RoomSpeaker, room_instructions,
+    validate_participants,
+};
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
-use store::{SessionSummary, Store, StoreError};
+use store::{Store, StoreError};
 use stream::{Completion, StreamEvent};
 use terminal::InputSuppression;
 use thiserror::Error;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 const CONFIG_PATH: &str = "tapet.toml";
@@ -31,11 +33,16 @@ const DATABASE_PATH: &str = ".tapet/tapet.db";
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Agents,
-    Sessions,
     Ask { agent: String, message: String },
-    Chat { agent: String },
-    Attach { session: SessionId },
-    History { session: SessionId },
+    Room { source: RoomSource },
+    Enter { room: RoomId },
+    History { room: RoomId },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RoomSource {
+    With(Vec<String>),
+    From(String),
 }
 
 fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command, AppError> {
@@ -52,12 +59,6 @@ fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command,
             }
             Ok(Command::Agents)
         }
-        "sessions" => {
-            if args.next().is_some() {
-                return Err(AppError::Usage);
-            }
-            Ok(Command::Sessions)
-        }
         "ask" => {
             let agent = next_argument(&mut args)?;
             let message = next_argument(&mut args)?;
@@ -66,29 +67,51 @@ fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command,
             }
             Ok(Command::Ask { agent, message })
         }
-        "chat" => {
-            let agent = next_argument(&mut args)?;
-            if args.next().is_some() {
-                return Err(AppError::Usage);
-            }
-            Ok(Command::Chat { agent })
+        "room" => {
+            let arguments: Result<Vec<_>, _> = args
+                .map(|argument| argument.into_string().map_err(|_| AppError::Usage))
+                .collect();
+            Ok(Command::Room {
+                source: parse_room_source(&arguments?)?,
+            })
         }
-        "attach" => {
-            let session = next_argument(&mut args)?.parse()?;
+        "enter" => {
+            let room = next_argument(&mut args)?.parse()?;
             if args.next().is_some() {
                 return Err(AppError::Usage);
             }
-            Ok(Command::Attach { session })
+            Ok(Command::Enter { room })
         }
         "history" => {
-            let session = next_argument(&mut args)?.parse()?;
+            let room = next_argument(&mut args)?.parse()?;
             if args.next().is_some() {
                 return Err(AppError::Usage);
             }
-            Ok(Command::History { session })
+            Ok(Command::History { room })
         }
         _ => Err(AppError::Usage),
     }
+}
+
+fn parse_room_source(arguments: &[String]) -> Result<RoomSource, AppError> {
+    if let [flag, name] = arguments
+        && flag == "--from"
+        && !name.is_empty()
+    {
+        return Ok(RoomSource::From(name.clone()));
+    }
+
+    if arguments.is_empty() || !arguments.len().is_multiple_of(2) {
+        return Err(AppError::Usage);
+    }
+    let mut agents = Vec::new();
+    for pair in arguments.chunks_exact(2) {
+        if pair[0] != "--with" || pair[1].is_empty() || pair[1].starts_with("--") {
+            return Err(AppError::Usage);
+        }
+        agents.push(pair[1].clone());
+    }
+    Ok(RoomSource::With(agents))
 }
 
 fn next_argument(args: &mut impl Iterator<Item = OsString>) -> Result<String, AppError> {
@@ -106,12 +129,6 @@ async fn try_main() -> Result<(), AppError> {
             let config = Config::load(Path::new(CONFIG_PATH))?;
             let stdout = io::stdout();
             write_agents(config.agents(), &mut stdout.lock())?;
-        }
-        Command::Sessions => {
-            let store = Store::open(DATABASE_PATH).await?;
-            let sessions = store.sessions().await?;
-            let stdout = io::stdout();
-            write_sessions(&sessions, &mut stdout.lock())?;
         }
         Command::Ask {
             agent: agent_name,
@@ -131,48 +148,55 @@ async fn try_main() -> Result<(), AppError> {
             )
             .await?;
         }
-        Command::Chat { agent: agent_name } => {
+        Command::Room { source } => {
             let config = Config::load(Path::new(CONFIG_PATH))?;
-            let agent = config.agent(&agent_name)?;
-            let client = OpenAiClient::from_agent(agent)?;
-            let snapshot = AgentSnapshot::resolve(agent);
+            let (agent_names, description, prompt) = match source {
+                RoomSource::With(agents) => (agents, String::new(), String::new()),
+                RoomSource::From(template) => {
+                    let template = config.room(&template)?;
+                    (
+                        template.agents().to_vec(),
+                        template.description().to_owned(),
+                        template.prompt().to_owned(),
+                    )
+                }
+            };
+            let participants = agent_names
+                .iter()
+                .map(|name| config.agent(name).map(AgentSnapshot::resolve))
+                .collect::<Result<Vec<_>, _>>()?;
+            validate_participants(&participants)?;
             let store = Store::open(DATABASE_PATH).await?;
-            let session = store.create_session(snapshot).await?;
+            let room = store.create_room(participants, description, prompt).await?;
             let input = BufReader::new(tokio::io::stdin());
             let stdout = io::stdout();
             let mut output = stdout.lock();
-            writeln!(output, "Session {}", session.id())?;
-            writeln!(output, "{}> ready", session.agent().agent_name())?;
-            run_chat(Conversation::new(store, session), &client, input, output).await?;
+            writeln!(output, "Starting new room: {}", room.id())?;
+            write_room_ready(&room, &mut output)?;
+            run_room(store, room, input, output).await?;
         }
-        Command::Attach { session: id } => {
+        Command::Enter { room: id } => {
             let store = Store::open(DATABASE_PATH).await?;
-            let session = store.load_session(&id).await?;
-            let messages = store.history(&id).await?;
-            let client = client_for_session(&session)?;
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            let room = store.load_room(&id).await?;
+            let messages = store.room_history(&id).await?;
             let input = BufReader::new(tokio::io::stdin());
-            let stdout = io::stdout();
-            let mut output = stdout.lock();
-            writeln!(output, "Session {}", session.id())?;
-            write_history(session.agent().agent_name(), &messages, &mut output)?;
-            run_chat(Conversation::new(store, session), &client, input, output).await?;
+            writeln!(output, "Room {}", room.id())?;
+            write_room_history(&messages, &mut output)?;
+            run_room(store, room, input, output).await?;
         }
-        Command::History { session: id } => {
+        Command::History { room: id } => {
             let store = Store::open(DATABASE_PATH).await?;
-            let session = store.load_session(&id).await?;
-            let messages = store.history(&id).await?;
             let stdout = io::stdout();
             let mut output = stdout.lock();
-            write_history(session.agent().agent_name(), &messages, &mut output)?;
+            store.load_room(&id).await?;
+            let messages = store.room_history(&id).await?;
+            write_room_history(&messages, &mut output)?;
         }
     }
 
     Ok(())
-}
-
-fn client_for_session(session: &session::Session) -> Result<OpenAiClient, ProviderError> {
-    let agent = session.agent();
-    OpenAiClient::from_settings(agent.base_url(), agent.api_key_env(), agent.model())
 }
 
 fn write_agents<'a>(
@@ -192,51 +216,36 @@ fn write_agents<'a>(
     Ok(())
 }
 
-fn write_sessions(sessions: &[SessionSummary], output: &mut impl Write) -> io::Result<()> {
-    for session in sessions {
-        let updated_at = format_timestamp(session.updated_at_ms())?;
-        writeln!(
-            output,
-            "{}\t{}\t{}\t{}",
-            session.id(),
-            session.agent_name(),
-            session.model(),
-            updated_at
-        )?;
+fn write_room_ready(room: &Room, output: &mut impl Write) -> io::Result<()> {
+    let participants = room
+        .participants()
+        .iter()
+        .map(|participant| format!("@{}", participant.agent_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !room.description().is_empty() {
+        writeln!(output, "room> {}", room.description())?;
     }
-    Ok(())
+    writeln!(output, "room> ready ({participants})")
 }
 
-fn format_timestamp(millis: i64) -> io::Result<String> {
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-        .format(&Rfc3339)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-fn write_history(
-    agent_name: &str,
-    messages: &[Message],
-    output: &mut impl Write,
-) -> io::Result<()> {
+fn write_room_history(messages: &[RoomMessage], output: &mut impl Write) -> io::Result<()> {
     for message in messages {
-        let speaker = match message.role() {
-            MessageRole::User => "you",
-            MessageRole::Assistant => agent_name,
+        let speaker = match message.speaker() {
+            RoomSpeaker::User => "you",
+            RoomSpeaker::Agent(name) => name,
         };
-        writeln!(output, "{speaker}> {}", message.content())?;
+        writeln!(output, "{speaker}> {}", message.visible_content())?;
     }
     Ok(())
 }
 
-async fn run_chat(
-    conversation: Conversation,
-    client: &OpenAiClient,
+async fn run_room(
+    store: Store,
+    room: Room,
     mut input: impl AsyncBufRead + Unpin,
     mut output: impl Write,
 ) -> Result<(), AppError> {
-    let agent = conversation.session().agent();
-
     loop {
         let input_action = tokio::select! {
             result = read_user_input(&mut input, &mut output) => result?,
@@ -246,45 +255,92 @@ async fn run_chat(
                 return Ok(());
             }
         };
-
         let message = match input_action {
             UserInput::Message(message) => message,
             UserInput::Ignore => continue,
             UserInput::Exit => return Ok(()),
         };
 
-        let input_suppression = InputSuppression::start()?;
-        let turn = conversation.begin_turn(message).await?;
-        let outcome = tokio::select! {
-            result = render_response(
-                agent.agent_name(),
-                agent.system_prompt(),
-                client,
-                turn.messages(),
-                &mut output,
-            ) => TurnOutcome::Response(result),
-            result = tokio::signal::ctrl_c() => TurnOutcome::Interrupted(result),
+        let room_message = RoomMessage::user(message);
+        let targets = match room.route(&room_message) {
+            Ok(targets) => targets
+                .into_iter()
+                .map(|participant| participant.agent_name().to_owned())
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                writeln!(output, "room> {error}")?;
+                continue;
+            }
         };
+        let appended = store
+            .append_room_user_message(room.id(), room_message.content().to_owned())
+            .await?;
+        let provider_messages = appended
+            .messages
+            .iter()
+            .map(RoomMessage::as_provider_message)
+            .collect::<Vec<_>>();
+        let input_suppression = InputSuppression::start()?;
+        let mut failures = Vec::new();
+
+        for target in targets {
+            let participant = room
+                .participant(&target)
+                .expect("room routing only returns participants");
+            let call_id = store
+                .begin_room_call(room.id(), &target, appended.message_id)
+                .await?;
+            let client = match OpenAiClient::from_settings(
+                participant.base_url(),
+                participant.api_key_env(),
+                participant.model(),
+            ) {
+                Ok(client) => client,
+                Err(error) => {
+                    store.fail_room_call(call_id, error.to_string()).await?;
+                    failures.push(format!("@{target}: {error}"));
+                    continue;
+                }
+            };
+            let instructions = room_instructions(&room, participant);
+            let outcome = tokio::select! {
+                result = render_room_response(
+                    participant.agent_name(),
+                    &instructions,
+                    &client,
+                    &provider_messages,
+                    &mut output,
+                ) => TurnOutcome::Response(result),
+                result = tokio::signal::ctrl_c() => TurnOutcome::Interrupted(result),
+            };
+
+            match outcome {
+                TurnOutcome::Response(Ok(response)) => {
+                    store
+                        .complete_room_call(call_id, response.text, response.completion)
+                        .await?;
+                }
+                TurnOutcome::Response(Err(error)) => {
+                    store.fail_room_call(call_id, error.to_string()).await?;
+                    failures.push(format!("@{target}: {error}"));
+                }
+                TurnOutcome::Interrupted(signal) => {
+                    let failure = match &signal {
+                        Ok(()) => "cancelled by user".to_owned(),
+                        Err(error) => format!("failed to listen for Ctrl-C: {error}"),
+                    };
+                    store.fail_room_call(call_id, failure).await?;
+                    drop(input_suppression);
+                    signal?;
+                    writeln!(output)?;
+                    return Ok(());
+                }
+            }
+        }
         drop(input_suppression);
 
-        match outcome {
-            TurnOutcome::Response(Ok(response)) => {
-                turn.complete(response.text, response.completion).await?;
-            }
-            TurnOutcome::Response(Err(error)) => {
-                turn.fail(error.to_string()).await?;
-                return Err(error);
-            }
-            TurnOutcome::Interrupted(signal) => {
-                let failure = match &signal {
-                    Ok(()) => "cancelled by user".to_owned(),
-                    Err(error) => format!("failed to listen for Ctrl-C: {error}"),
-                };
-                turn.fail(failure).await?;
-                signal?;
-                writeln!(output)?;
-                return Ok(());
-            }
+        if !failures.is_empty() {
+            return Err(AppError::RoomCalls(failures.join("; ")));
         }
     }
 }
@@ -306,6 +362,29 @@ async fn render_response(
     output.flush()?;
 
     match render_events(events, output).await {
+        Ok(message) => {
+            writeln!(output)?;
+            Ok(message)
+        }
+        Err(error) => {
+            let _ = writeln!(output);
+            Err(error)
+        }
+    }
+}
+
+async fn render_room_response(
+    agent_name: &str,
+    system_prompt: &str,
+    client: &OpenAiClient,
+    messages: &[Message],
+    output: &mut impl Write,
+) -> Result<AssistantResponse, AppError> {
+    let events = client.stream(system_prompt, messages).await?;
+    write!(output, "{agent_name}> ")?;
+    output.flush()?;
+
+    match render_room_events(events, agent_name, output).await {
         Ok(message) => {
             writeln!(output)?;
             Ok(message)
@@ -351,6 +430,117 @@ where
     Err(ProviderError::IncompleteStream.into())
 }
 
+async fn render_room_events<S>(
+    mut events: S,
+    agent_name: &str,
+    output: &mut impl Write,
+) -> Result<AssistantResponse, AppError>
+where
+    S: Stream<Item = Result<StreamEvent, ProviderError>> + Unpin,
+{
+    let mut filter = LeadingAttributionFilter::new(agent_name);
+    let mut message = String::new();
+
+    while let Some(event) = events.next().await {
+        match event? {
+            StreamEvent::TextDelta(delta) => {
+                let visible = filter.push(&delta);
+                output.write_all(visible.as_bytes())?;
+                if !visible.is_empty() {
+                    output.flush()?;
+                    message.push_str(&visible);
+                }
+            }
+            StreamEvent::Completed(completion) => {
+                let visible = filter.finish();
+                output.write_all(visible.as_bytes())?;
+                if !visible.is_empty() {
+                    output.flush()?;
+                    message.push_str(&visible);
+                }
+                return Ok(AssistantResponse {
+                    text: message,
+                    completion,
+                });
+            }
+        }
+    }
+
+    Err(ProviderError::IncompleteStream.into())
+}
+
+struct LeadingAttributionFilter {
+    prefix: String,
+    pending: Option<String>,
+}
+
+impl LeadingAttributionFilter {
+    fn new(agent_name: &str) -> Self {
+        Self {
+            prefix: format!("@{}", agent_name.to_ascii_lowercase()),
+            pending: Some(String::new()),
+        }
+    }
+
+    fn push(&mut self, delta: &str) -> String {
+        let Some(pending) = &mut self.pending else {
+            return delta.to_owned();
+        };
+        pending.push_str(delta);
+        let lowercase = pending.to_ascii_lowercase();
+
+        if pending.len() < self.prefix.len() {
+            if self.prefix.starts_with(&lowercase) {
+                return String::new();
+            }
+            return self.pending.take().expect("pending response exists");
+        }
+        if !lowercase.starts_with(&self.prefix) {
+            return self.pending.take().expect("pending response exists");
+        }
+
+        let remainder = &pending[self.prefix.len()..];
+        if remainder.is_empty() {
+            return String::new();
+        }
+        let remainder = if let Some(remainder) = remainder.strip_prefix(':') {
+            remainder
+        } else if remainder.starts_with(char::is_whitespace) {
+            remainder
+        } else {
+            return self.pending.take().expect("pending response exists");
+        };
+        let visible = remainder.trim_start_matches(char::is_whitespace);
+        if visible.is_empty() {
+            return String::new();
+        }
+
+        let visible = visible.to_owned();
+        self.pending = None;
+        visible
+    }
+
+    fn finish(&mut self) -> String {
+        let Some(pending) = self.pending.take() else {
+            return String::new();
+        };
+        if pending.len() < self.prefix.len() {
+            return pending;
+        }
+        let lowercase = pending.to_ascii_lowercase();
+        if !lowercase.starts_with(&self.prefix) {
+            return pending;
+        }
+        let remainder = &pending[self.prefix.len()..];
+        let remainder = remainder.strip_prefix(':').unwrap_or(remainder);
+        if remainder.trim().is_empty() {
+            String::new()
+        } else {
+            pending
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum UserInput {
     Message(String),
@@ -389,7 +579,7 @@ async fn main() {
 #[derive(Debug, Error)]
 enum AppError {
     #[error(
-        "usage: tapet agents\n       tapet sessions\n       tapet ask <agent> <message>\n       tapet chat <agent>\n       tapet attach <session>\n       tapet history <session>"
+        "usage: tapet agents\n       tapet ask <agent> <message>\n       tapet room --with <agent> [--with <agent>...]\n       tapet room --from <template>\n       tapet enter <room>\n       tapet history <room>"
     )]
     Usage,
     #[error(transparent)]
@@ -397,7 +587,11 @@ enum AppError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error(transparent)]
-    SessionId(#[from] SessionIdError),
+    RoomId(#[from] RoomIdError),
+    #[error(transparent)]
+    Room(#[from] RoomError),
+    #[error("one or more room responses failed: {0}")]
+    RoomCalls(String),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error("I/O error: {0}")]
@@ -407,14 +601,12 @@ enum AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, UserInput, read_user_input, render_events, selected_command, write_agents,
-        write_history, write_sessions,
+        Command, RoomSource, UserInput, read_user_input, render_events, render_room_events,
+        selected_command, write_agents, write_room_history,
     };
     use crate::config::Config;
-    use crate::message::Message;
     use crate::openai::{ProviderError, decode_stream};
-    use crate::session::SessionId;
-    use crate::store::SessionSummary;
+    use crate::room::RoomMessage;
     use crate::stream::{Completion, StreamEvent};
     use futures_util::stream;
     use std::ffi::OsString;
@@ -424,19 +616,15 @@ mod tests {
     use tokio::io::BufReader;
 
     #[test]
-    fn parses_listing_commands() {
+    fn parses_agent_listing_command() {
         assert_eq!(
             selected_command([OsString::from("agents")].into_iter()).unwrap(),
             Command::Agents
         );
-        assert_eq!(
-            selected_command([OsString::from("sessions")].into_iter()).unwrap(),
-            Command::Sessions
-        );
     }
 
     #[test]
-    fn parses_ask_and_chat_commands() {
+    fn parses_ask_command() {
         assert_eq!(
             selected_command(
                 [
@@ -452,29 +640,64 @@ mod tests {
                 message: "hello".to_owned()
             }
         );
-        assert_eq!(
-            selected_command([OsString::from("chat"), OsString::from("explorer")].into_iter())
-                .unwrap(),
-            Command::Chat {
-                agent: "explorer".to_owned()
-            }
-        );
     }
 
     #[test]
-    fn parses_attach_and_history_commands() {
-        let id = "ses_550e8400e29b41d4a716446655440000";
-        let session: SessionId = id.parse().unwrap();
-
+    fn parses_room_commands_and_room_ids() {
         assert_eq!(
-            selected_command([OsString::from("attach"), OsString::from(id)].into_iter()).unwrap(),
-            Command::Attach {
-                session: session.clone()
+            selected_command(
+                [
+                    OsString::from("room"),
+                    OsString::from("--with"),
+                    OsString::from("explorer"),
+                ]
+                .into_iter()
+            )
+            .unwrap(),
+            Command::Room {
+                source: RoomSource::With(vec!["explorer".to_owned()])
             }
         );
         assert_eq!(
+            selected_command(
+                [
+                    OsString::from("room"),
+                    OsString::from("--with"),
+                    OsString::from("explorer"),
+                    OsString::from("--with"),
+                    OsString::from("reviewer"),
+                ]
+                .into_iter(),
+            )
+            .unwrap(),
+            Command::Room {
+                source: RoomSource::With(vec!["explorer".to_owned(), "reviewer".to_owned()])
+            }
+        );
+        assert_eq!(
+            selected_command(
+                [
+                    OsString::from("room"),
+                    OsString::from("--from"),
+                    OsString::from("research"),
+                ]
+                .into_iter()
+            )
+            .unwrap(),
+            Command::Room {
+                source: RoomSource::From("research".to_owned())
+            }
+        );
+
+        let id = "room_550e8400e29b41d4a716446655440000";
+        let room: crate::room::RoomId = id.parse().unwrap();
+        assert_eq!(
+            selected_command([OsString::from("enter"), OsString::from(id)].into_iter()).unwrap(),
+            Command::Enter { room: room.clone() }
+        );
+        assert_eq!(
             selected_command([OsString::from("history"), OsString::from(id)].into_iter()).unwrap(),
-            Command::History { session }
+            Command::History { room }
         );
     }
 
@@ -482,27 +705,35 @@ mod tests {
     fn rejects_incomplete_or_extra_arguments() {
         assert!(selected_command(std::iter::empty()).is_err());
         assert!(selected_command([OsString::from("ask")].into_iter()).is_err());
-        assert!(selected_command([OsString::from("chat")].into_iter()).is_err());
+        assert!(selected_command([OsString::from("room")].into_iter()).is_err());
+        assert!(
+            selected_command([OsString::from("room"), OsString::from("explorer")].into_iter())
+                .is_err()
+        );
+        assert!(
+            selected_command(
+                [
+                    OsString::from("room"),
+                    OsString::from("--from"),
+                    OsString::from("research"),
+                    OsString::from("--with"),
+                    OsString::from("explorer"),
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+        assert!(
+            selected_command([OsString::from("chat"), OsString::from("explorer")].into_iter())
+                .is_err()
+        );
         assert!(
             selected_command([OsString::from("agents"), OsString::from("extra")].into_iter())
                 .is_err()
         );
         assert!(
-            selected_command(
-                [OsString::from("attach"), OsString::from("not-a-session")].into_iter()
-            )
-            .is_err()
-        );
-        assert!(
-            selected_command(
-                [
-                    OsString::from("chat"),
-                    OsString::from("explorer"),
-                    OsString::from("extra")
-                ]
-                .into_iter()
-            )
-            .is_err()
+            selected_command([OsString::from("enter"), OsString::from("not-a-room")].into_iter())
+                .is_err()
         );
     }
 
@@ -541,19 +772,22 @@ mod tests {
     }
 
     #[test]
-    fn formats_session_history_with_speaker_names() {
+    fn formats_room_history_with_attributed_speakers() {
         let mut output = Vec::new();
 
-        write_history(
-            "explorer",
-            &[Message::user("Hello"), Message::assistant("Hi")],
+        write_room_history(
+            &[
+                RoomMessage::user("@explorer Hello"),
+                RoomMessage::agent("explorer", "@EXPLORER: Hi"),
+                RoomMessage::agent("reviewer", "I agree"),
+            ],
             &mut output,
         )
         .unwrap();
 
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "you> Hello\nexplorer> Hi\n"
+            "you> @explorer Hello\nexplorer> Hi\nreviewer> I agree\n"
         );
     }
 
@@ -586,25 +820,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_listing_has_stable_tab_separated_output() {
-        let sessions = [
-            SessionSummary::fixture("ses_new", "reviewer", "deep-model", 1_700_000_000_000),
-            SessionSummary::fixture("ses_old", "explorer", "fast-model", 1_600_000_000_000),
-        ];
-        let mut output = Vec::new();
-
-        write_sessions(&sessions, &mut output).unwrap();
-
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            concat!(
-                "ses_new\treviewer\tdeep-model\t2023-11-14T22:13:20Z\n",
-                "ses_old\texplorer\tfast-model\t2020-09-13T12:26:40Z\n"
-            )
-        );
-    }
-
     #[tokio::test]
     async fn printed_deltas_are_the_stored_assistant_message() {
         let events = stream::iter([
@@ -619,6 +834,42 @@ mod tests {
         assert_eq!(message.text, "Ownership");
         assert_eq!(String::from_utf8(output.bytes).unwrap(), message.text);
         assert_eq!(output.flushes, 2);
+    }
+
+    #[tokio::test]
+    async fn room_responses_hide_and_remove_a_streamed_self_attribution() {
+        let events = stream::iter([
+            Ok(StreamEvent::TextDelta("@SH".to_owned())),
+            Ok(StreamEvent::TextDelta("OUTER: ".to_owned())),
+            Ok(StreamEvent::TextDelta("HELLO".to_owned())),
+            Ok(StreamEvent::Completed(completion())),
+        ]);
+        let mut output = TrackingWriter::default();
+
+        let message = render_room_events(events, "shouter", &mut output)
+            .await
+            .unwrap();
+
+        assert_eq!(message.text, "HELLO");
+        assert_eq!(String::from_utf8(output.bytes).unwrap(), "HELLO");
+        assert_eq!(output.flushes, 1);
+    }
+
+    #[tokio::test]
+    async fn room_responses_preserve_text_that_is_not_a_self_attribution() {
+        let events = stream::iter([
+            Ok(StreamEvent::TextDelta("@exploration".to_owned())),
+            Ok(StreamEvent::TextDelta(" continues".to_owned())),
+            Ok(StreamEvent::Completed(completion())),
+        ]);
+        let mut output = Vec::new();
+
+        let message = render_room_events(events, "explorer", &mut output)
+            .await
+            .unwrap();
+
+        assert_eq!(message.text, "@exploration continues");
+        assert_eq!(String::from_utf8(output).unwrap(), message.text);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
+use crate::agent::AgentSnapshot;
 use crate::config::ProviderKind;
-use crate::message::Message;
-use crate::session::{AgentSnapshot, Session, SessionId};
+use crate::room::{Room, RoomId, RoomMessage};
 use crate::stream::Completion;
 use std::fs;
 use std::path::Path;
@@ -8,7 +8,7 @@ use std::time::Duration;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio_rusqlite::Connection;
-use tokio_rusqlite::rusqlite::{self, OptionalExtension, TransactionBehavior, params};
+use tokio_rusqlite::rusqlite::{self, TransactionBehavior, params};
 
 const SCHEMA_VERSION: i64 = 1;
 const MIGRATION_001: &str = include_str!("../migrations/001_initial.sql");
@@ -41,13 +41,13 @@ impl Store {
             })
             .await?;
 
-        if version > SCHEMA_VERSION {
+        if version != 0 && version != SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion {
                 found: version,
                 supported: SCHEMA_VERSION,
             });
         }
-        if version < SCHEMA_VERSION {
+        if version == 0 {
             connection
                 .call(|connection| {
                     let transaction = connection.transaction()?;
@@ -61,10 +61,17 @@ impl Store {
         Ok(Self { connection })
     }
 
-    pub async fn create_session(&self, agent: AgentSnapshot) -> Result<Session, StoreError> {
-        let id = SessionId::new();
+    pub async fn create_room(
+        &self,
+        participants: Vec<AgentSnapshot>,
+        description: String,
+        prompt: String,
+    ) -> Result<Room, StoreError> {
+        let id = RoomId::new();
         let stored_id = id.to_string();
-        let stored_agent = agent.clone();
+        let stored_participants = participants.clone();
+        let stored_description = description.clone();
+        let stored_prompt = prompt.clone();
         let now = now_millis();
 
         self.connection
@@ -72,145 +79,145 @@ impl Store {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 transaction.execute(
-                    "INSERT INTO sessions (
-                        id, agent_name, provider_kind, base_url, api_key_env, model,
-                        system_prompt, created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-                    params![
-                        stored_id,
-                        stored_agent.agent_name(),
-                        stored_agent.provider_kind().as_str(),
-                        stored_agent.base_url(),
-                        stored_agent.api_key_env(),
-                        stored_agent.model(),
-                        stored_agent.system_prompt(),
-                        now,
-                    ],
+                    "INSERT INTO rooms (
+                        id, description, system_prompt, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?4)",
+                    params![stored_id, stored_description, stored_prompt, now],
                 )?;
+                for (position, participant) in stored_participants.iter().enumerate() {
+                    transaction.execute(
+                        "INSERT INTO room_participants (
+                            room_id, agent_name, provider_kind, base_url, api_key_env,
+                            model, system_prompt, position
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            stored_id,
+                            participant.agent_name(),
+                            participant.provider_kind().as_str(),
+                            participant.base_url(),
+                            participant.api_key_env(),
+                            participant.model(),
+                            participant.system_prompt(),
+                            i64::try_from(position).expect("participant position fits in i64"),
+                        ],
+                    )?;
+                }
                 transaction.commit()
             })
             .await?;
 
-        Ok(Session::new(id, agent))
+        Ok(Room::new(id, participants, description, prompt))
     }
 
-    pub async fn load_session(&self, id: &SessionId) -> Result<Session, StoreError> {
+    pub async fn load_room(&self, id: &RoomId) -> Result<Room, StoreError> {
         let stored_id = id.to_string();
-        let agent = self
+        let (participants, description, prompt) = self
             .connection
             .call(move |connection| {
-                connection
-                    .query_row(
-                        "SELECT agent_name, provider_kind, base_url, api_key_env, model, system_prompt
-                         FROM sessions WHERE id = ?1",
-                        [stored_id],
-                        |row| {
-                            let stored_kind: String = row.get(1)?;
-                            let provider_kind = ProviderKind::from_stored(&stored_kind)
-                                .ok_or(rusqlite::Error::InvalidQuery)?;
-                            Ok(AgentSnapshot::from_stored(
-                                row.get(0)?,
-                                provider_kind,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                                row.get(5)?,
-                            ))
-                        },
-                    )
-                    .optional()
-            })
-            .await?
-            .ok_or_else(|| StoreError::UnknownSession(id.to_string()))?;
-
-        Ok(Session::new(id.clone(), agent))
-    }
-
-    pub async fn history(&self, id: &SessionId) -> Result<Vec<Message>, StoreError> {
-        let stored_id = id.to_string();
-        let messages = self
-            .connection
-            .call(move |connection| query_messages(connection, &stored_id))
-            .await?;
-        Ok(messages)
-    }
-
-    pub async fn sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
-        Ok(self
-            .connection
-            .call(|connection| {
-                let mut statement = connection.prepare(
-                    "SELECT id, agent_name, model, updated_at
-                     FROM sessions ORDER BY updated_at DESC, id ASC",
-                )?;
-                statement
-                    .query_map([], |row| {
-                        Ok(SessionSummary {
-                            id: row.get(0)?,
-                            agent_name: row.get(1)?,
-                            model: row.get(2)?,
-                            updated_at_ms: row.get(3)?,
-                        })
-                    })?
-                    .collect()
-            })
-            .await?)
-    }
-
-    pub(crate) async fn begin_call(
-        &self,
-        session_id: &SessionId,
-        user_message: String,
-    ) -> Result<BegunCall, StoreError> {
-        let stored_id = session_id.to_string();
-        let now = now_millis();
-        let (call_id, messages) = self
-            .connection
-            .call(move |connection| {
-                let transaction =
-                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let session_exists = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                let (description, prompt): (String, String) = connection.query_row(
+                    "SELECT description, system_prompt FROM rooms WHERE id = ?1",
                     [&stored_id],
-                    |row| row.get::<_, bool>(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                if !session_exists {
-                    return Err(rusqlite::Error::QueryReturnedNoRows);
-                }
-
-                transaction.execute(
-                    "INSERT INTO messages (session_id, role, content, created_at)
-                     VALUES (?1, 'user', ?2, ?3)",
-                    params![stored_id, user_message, now],
-                )?;
-                let user_message_id = transaction.last_insert_rowid();
-                transaction.execute(
-                    "INSERT INTO model_calls (
-                        session_id, user_message_id, status, started_at
-                     ) VALUES (?1, ?2, 'running', ?3)",
-                    params![stored_id, user_message_id, now],
-                )?;
-                let call_id = transaction.last_insert_rowid();
-                transaction.execute(
-                    "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-                    params![stored_id, now],
-                )?;
-                let messages = query_messages(&transaction, &stored_id)?;
-                transaction.commit()?;
-                Ok((call_id, messages))
+                let participants = query_room_participants(connection, &stored_id)?;
+                Ok((participants, description, prompt))
             })
             .await
             .map_err(|error| match error {
                 tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows) => {
-                    StoreError::UnknownSession(session_id.to_string())
+                    StoreError::UnknownRoom(id.to_string())
                 }
                 other => StoreError::Worker(other),
             })?;
 
-        Ok(BegunCall { call_id, messages })
+        Ok(Room::new(id.clone(), participants, description, prompt))
     }
 
-    pub(crate) async fn complete_call(
+    pub async fn room_history(&self, id: &RoomId) -> Result<Vec<RoomMessage>, StoreError> {
+        let stored_id = id.to_string();
+        Ok(self
+            .connection
+            .call(move |connection| query_room_messages(connection, &stored_id))
+            .await?)
+    }
+
+    pub(crate) async fn append_room_user_message(
+        &self,
+        room_id: &RoomId,
+        content: String,
+    ) -> Result<AppendedRoomMessage, StoreError> {
+        let stored_id = room_id.to_string();
+        let now = now_millis();
+        let (message_id, messages) = self
+            .connection
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let room_exists = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1)",
+                    [&stored_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !room_exists {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                transaction.execute(
+                    "INSERT INTO room_messages (
+                        room_id, speaker_kind, speaker_name, content, created_at
+                     ) VALUES (?1, 'user', NULL, ?2, ?3)",
+                    params![stored_id, content, now],
+                )?;
+                let message_id = transaction.last_insert_rowid();
+                transaction.execute(
+                    "UPDATE rooms SET updated_at = ?2 WHERE id = ?1",
+                    params![stored_id, now],
+                )?;
+                let messages = query_room_messages(&transaction, &stored_id)?;
+                transaction.commit()?;
+                Ok((message_id, messages))
+            })
+            .await
+            .map_err(|error| match error {
+                tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows) => {
+                    StoreError::UnknownRoom(room_id.to_string())
+                }
+                other => StoreError::Worker(other),
+            })?;
+
+        Ok(AppendedRoomMessage {
+            message_id,
+            messages,
+        })
+    }
+
+    pub(crate) async fn begin_room_call(
+        &self,
+        room_id: &RoomId,
+        participant_name: &str,
+        user_message_id: i64,
+    ) -> Result<i64, StoreError> {
+        let stored_id = room_id.to_string();
+        let participant_name = participant_name.to_owned();
+        let now = now_millis();
+        Ok(self
+            .connection
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "INSERT INTO room_calls (
+                        room_id, participant_name, user_message_id, status, started_at
+                     ) VALUES (?1, ?2, ?3, 'running', ?4)",
+                    params![stored_id, participant_name, user_message_id, now],
+                )?;
+                let call_id = transaction.last_insert_rowid();
+                transaction.commit()?;
+                Ok(call_id)
+            })
+            .await?)
+    }
+
+    pub(crate) async fn complete_room_call(
         &self,
         call_id: i64,
         assistant_message: String,
@@ -223,26 +230,24 @@ impl Store {
             .call(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let session_id: String = transaction.query_row(
-                    "SELECT session_id FROM model_calls
+                let (room_id, participant_name): (String, String) = transaction.query_row(
+                    "SELECT room_id, participant_name FROM room_calls
                      WHERE id = ?1 AND status = 'running'",
                     [call_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 transaction.execute(
-                    "INSERT INTO messages (session_id, role, content, created_at)
-                     VALUES (?1, 'assistant', ?2, ?3)",
-                    params![session_id, assistant_message, now],
+                    "INSERT INTO room_messages (
+                        room_id, speaker_kind, speaker_name, content, created_at
+                     ) VALUES (?1, 'agent', ?2, ?3, ?4)",
+                    params![room_id, participant_name, assistant_message, now],
                 )?;
                 let assistant_message_id = transaction.last_insert_rowid();
                 transaction.execute(
-                    "UPDATE model_calls SET
-                        assistant_message_id = ?2,
-                        status = 'completed',
-                        provider_response_id = ?3,
-                        input_tokens = ?4,
-                        output_tokens = ?5,
-                        finished_at = ?6
+                    "UPDATE room_calls SET
+                        assistant_message_id = ?2, status = 'completed',
+                        provider_response_id = ?3, input_tokens = ?4,
+                        output_tokens = ?5, finished_at = ?6
                      WHERE id = ?1 AND status = 'running'",
                     params![
                         call_id,
@@ -254,8 +259,8 @@ impl Store {
                     ],
                 )?;
                 transaction.execute(
-                    "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-                    params![session_id, now],
+                    "UPDATE rooms SET updated_at = ?2 WHERE id = ?1",
+                    params![room_id, now],
                 )?;
                 transaction.commit()
             })
@@ -263,113 +268,83 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) async fn fail_call(&self, call_id: i64, error: String) -> Result<(), StoreError> {
+    pub(crate) async fn fail_room_call(
+        &self,
+        call_id: i64,
+        error: String,
+    ) -> Result<(), StoreError> {
         let now = now_millis();
         self.connection
             .call(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let session_id: String = transaction.query_row(
-                    "SELECT session_id FROM model_calls
-                     WHERE id = ?1 AND status = 'running'",
+                let room_id: String = transaction.query_row(
+                    "SELECT room_id FROM room_calls WHERE id = ?1 AND status = 'running'",
                     [call_id],
                     |row| row.get(0),
                 )?;
                 transaction.execute(
-                    "UPDATE model_calls SET status = 'failed', error = ?2, finished_at = ?3
+                    "UPDATE room_calls SET status = 'failed', error = ?2, finished_at = ?3
                      WHERE id = ?1 AND status = 'running'",
                     params![call_id, error, now],
                 )?;
                 transaction.execute(
-                    "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-                    params![session_id, now],
+                    "UPDATE rooms SET updated_at = ?2 WHERE id = ?1",
+                    params![room_id, now],
                 )?;
                 transaction.commit()
             })
             .await?;
         Ok(())
     }
-
-    #[cfg(test)]
-    async fn call_record(&self, call_id: i64) -> Result<CallRecord, StoreError> {
-        Ok(self
-            .connection
-            .call(move |connection| {
-                connection.query_row(
-                    "SELECT status, provider_response_id, input_tokens, output_tokens, error
-                     FROM model_calls WHERE id = ?1",
-                    [call_id],
-                    |row| {
-                        Ok(CallRecord {
-                            status: row.get(0)?,
-                            provider_response_id: row.get(1)?,
-                            input_tokens: row.get(2)?,
-                            output_tokens: row.get(3)?,
-                            error: row.get(4)?,
-                        })
-                    },
-                )
-            })
-            .await?)
-    }
 }
 
-pub(crate) struct BegunCall {
-    pub call_id: i64,
-    pub messages: Vec<Message>,
+pub(crate) struct AppendedRoomMessage {
+    pub message_id: i64,
+    pub messages: Vec<RoomMessage>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionSummary {
-    id: String,
-    agent_name: String,
-    model: String,
-    updated_at_ms: i64,
-}
-
-impl SessionSummary {
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn agent_name(&self) -> &str {
-        &self.agent_name
-    }
-
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
-    pub fn updated_at_ms(&self) -> i64 {
-        self.updated_at_ms
-    }
-}
-
-#[cfg(test)]
-impl SessionSummary {
-    pub fn fixture(id: &str, agent_name: &str, model: &str, updated_at_ms: i64) -> Self {
-        Self {
-            id: id.to_owned(),
-            agent_name: agent_name.to_owned(),
-            model: model.to_owned(),
-            updated_at_ms,
-        }
-    }
-}
-
-fn query_messages(
+fn query_room_participants(
     connection: &rusqlite::Connection,
-    session_id: &str,
-) -> rusqlite::Result<Vec<Message>> {
-    let mut statement = connection
-        .prepare("SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY id ASC")?;
+    room_id: &str,
+) -> rusqlite::Result<Vec<AgentSnapshot>> {
+    let mut statement = connection.prepare(
+        "SELECT agent_name, provider_kind, base_url, api_key_env, model, system_prompt
+         FROM room_participants WHERE room_id = ?1 ORDER BY position ASC",
+    )?;
     statement
-        .query_map([session_id], |row| {
-            let role: String = row.get(0)?;
-            let content: String = row.get(1)?;
-            match role.as_str() {
-                "user" => Ok(Message::user(content)),
-                "assistant" => Ok(Message::assistant(content)),
+        .query_map([room_id], |row| {
+            let stored_kind: String = row.get(1)?;
+            let provider_kind =
+                ProviderKind::from_stored(&stored_kind).ok_or(rusqlite::Error::InvalidQuery)?;
+            Ok(AgentSnapshot::from_stored(
+                row.get(0)?,
+                provider_kind,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect()
+}
+
+fn query_room_messages(
+    connection: &rusqlite::Connection,
+    room_id: &str,
+) -> rusqlite::Result<Vec<RoomMessage>> {
+    let mut statement = connection.prepare(
+        "SELECT speaker_kind, speaker_name, content
+         FROM room_messages WHERE room_id = ?1 ORDER BY id ASC",
+    )?;
+    statement
+        .query_map([room_id], |row| {
+            let kind: String = row.get(0)?;
+            let name: Option<String> = row.get(1)?;
+            let content: String = row.get(2)?;
+            match (kind.as_str(), name) {
+                ("user", None) => Ok(RoomMessage::user(content)),
+                ("agent", Some(name)) => Ok(RoomMessage::agent(name, content)),
                 _ => Err(rusqlite::Error::InvalidQuery),
             }
         })?
@@ -396,141 +371,103 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("SQLite worker error: {0}")]
     Worker(#[from] tokio_rusqlite::Error),
-    #[error("database schema version {found} is newer than supported version {supported}")]
+    #[error("unsupported database schema version {found}; expected {supported}")]
     UnsupportedSchemaVersion { found: i64, supported: i64 },
-    #[error("unknown session `{0}`")]
-    UnknownSession(String),
+    #[error("unknown room `{0}`")]
+    UnknownRoom(String),
     #[error("token count {0} cannot be stored")]
     TokenCountOutOfRange(u64),
 }
 
 #[cfg(test)]
-#[derive(Debug, Eq, PartialEq)]
-struct CallRecord {
-    status: String,
-    provider_response_id: Option<String>,
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    error: Option<String>,
-}
-
-#[cfg(test)]
 mod tests {
-    use super::{CallRecord, Store, StoreError};
-    use crate::message::Message;
-    use crate::session::AgentSnapshot;
+    use super::{Store, StoreError};
+    use crate::agent::AgentSnapshot;
+    use crate::room::RoomMessage;
     use crate::stream::Completion;
     use tempfile::TempDir;
     use tokio_rusqlite::rusqlite::{Connection, TransactionBehavior};
 
     #[tokio::test]
-    async fn persists_the_snapshot_messages_and_completed_call() {
+    async fn persists_room_snapshots_history_and_calls() {
         let temporary = TempDir::new().unwrap();
         let path = temporary.path().join("tapet.db");
         let store = Store::open(&path).await.unwrap();
-        let snapshot = AgentSnapshot::fixture("Original prompt");
-        let session = store.create_session(snapshot.clone()).await.unwrap();
-
-        let call = store
-            .begin_call(session.id(), "Hello".to_owned())
-            .await
-            .unwrap();
-        assert_eq!(call.messages, [Message::user("Hello")]);
-        store
-            .complete_call(
-                call.call_id,
-                "Hi there".to_owned(),
-                Completion {
-                    provider_response_id: Some("resp_1".to_owned()),
-                    input_tokens: 7,
-                    output_tokens: 3,
-                },
+        let participants = vec![
+            AgentSnapshot::fixture_for("explorer", "fast-model", "Explore"),
+            AgentSnapshot::fixture_for("reviewer", "deep-model", "Review"),
+        ];
+        let room = store
+            .create_room(
+                participants.clone(),
+                "Research room".to_owned(),
+                "Cite evidence".to_owned(),
             )
             .await
             .unwrap();
-
-        let second_process = Store::open(&path).await.unwrap();
-        let loaded = second_process.load_session(session.id()).await.unwrap();
-        assert_eq!(loaded.agent(), &snapshot);
-        assert_eq!(
-            second_process.history(session.id()).await.unwrap(),
-            [Message::user("Hello"), Message::assistant("Hi there")]
-        );
-        let resumed = second_process
-            .begin_call(session.id(), "Remember me?".to_owned())
+        let appended = store
+            .append_room_user_message(room.id(), "@explorer investigate".to_owned())
             .await
             .unwrap();
+        let call_id = store
+            .begin_room_call(room.id(), "explorer", appended.message_id)
+            .await
+            .unwrap();
+        store
+            .complete_room_call(call_id, "Done".to_owned(), completion())
+            .await
+            .unwrap();
+
+        let reopened = Store::open(&path).await.unwrap();
         assert_eq!(
-            resumed.messages,
+            reopened.load_room(room.id()).await.unwrap().participants(),
+            participants
+        );
+        assert_eq!(
+            reopened.room_history(room.id()).await.unwrap(),
             [
-                Message::user("Hello"),
-                Message::assistant("Hi there"),
-                Message::user("Remember me?")
+                RoomMessage::user("@explorer investigate"),
+                RoomMessage::agent("explorer", "Done"),
             ]
         );
-        second_process
-            .fail_call(resumed.call_id, "test cleanup".to_owned())
-            .await
-            .unwrap();
-        assert_eq!(
-            second_process.call_record(call.call_id).await.unwrap(),
-            CallRecord {
-                status: "completed".to_owned(),
-                provider_response_id: Some("resp_1".to_owned()),
-                input_tokens: Some(7),
-                output_tokens: Some(3),
-                error: None,
-            }
-        );
+        let loaded = reopened.load_room(room.id()).await.unwrap();
+        assert_eq!(loaded.description(), "Research room");
+        assert_eq!(loaded.prompt(), "Cite evidence");
     }
 
     #[tokio::test]
-    async fn failed_calls_are_durable_without_an_assistant_message() {
+    async fn supports_single_agent_rooms() {
         let temporary = TempDir::new().unwrap();
         let store = Store::open(temporary.path().join("tapet.db"))
             .await
             .unwrap();
-        let session = store
-            .create_session(AgentSnapshot::fixture("Prompt"))
+        let participant = AgentSnapshot::fixture("Explore");
+        let room = store
+            .create_room(vec![participant.clone()], String::new(), String::new())
             .await
             .unwrap();
-        let call = store
-            .begin_call(session.id(), "Will fail".to_owned())
-            .await
-            .unwrap();
-
-        store
-            .fail_call(call.call_id, "provider failed".to_owned())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store.history(session.id()).await.unwrap(),
-            [Message::user("Will fail")]
-        );
-        assert_eq!(
-            store.call_record(call.call_id).await.unwrap(),
-            CallRecord {
-                status: "failed".to_owned(),
-                provider_response_id: None,
-                input_tokens: None,
-                output_tokens: None,
-                error: Some("provider failed".to_owned()),
-            }
-        );
+        assert_eq!(room.participants(), [participant]);
     }
 
     #[tokio::test]
-    async fn no_transaction_remains_open_during_the_provider_call() {
+    async fn no_transaction_remains_open_during_a_provider_call() {
         let temporary = TempDir::new().unwrap();
         let path = temporary.path().join("tapet.db");
         let store = Store::open(&path).await.unwrap();
-        let session = store
-            .create_session(AgentSnapshot::fixture("Prompt"))
+        let room = store
+            .create_room(
+                vec![AgentSnapshot::fixture("Explore")],
+                String::new(),
+                String::new(),
+            )
             .await
             .unwrap();
-        let call = store
-            .begin_call(session.id(), "Question".to_owned())
+        let appended = store
+            .append_room_user_message(room.id(), "question".to_owned())
+            .await
+            .unwrap();
+        let call_id = store
+            .begin_room_call(room.id(), "explorer", appended.message_id)
             .await
             .unwrap();
 
@@ -540,9 +477,8 @@ mod tests {
             .unwrap()
             .commit()
             .unwrap();
-
         store
-            .fail_call(call.call_id, "test cleanup".to_owned())
+            .fail_room_call(call_id, "test cleanup".to_owned())
             .await
             .unwrap();
     }
@@ -565,12 +501,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configures_sqlite_for_local_concurrent_processes() {
+    async fn configures_sqlite_for_concurrent_local_processes() {
         let temporary = TempDir::new().unwrap();
         let store = Store::open(temporary.path().join("tapet.db"))
             .await
             .unwrap();
-
         let (journal_mode, foreign_keys, busy_timeout, user_version) = store
             .connection
             .call(|connection| {
@@ -594,140 +529,10 @@ mod tests {
         assert_eq!(user_version, 1);
     }
 
-    #[tokio::test]
-    async fn lists_sessions_by_updated_time_with_stable_ties() {
-        let temporary = TempDir::new().unwrap();
-        let store = Store::open(temporary.path().join("tapet.db"))
-            .await
-            .unwrap();
-        let explorer = store
-            .create_session(AgentSnapshot::fixture_for(
-                "explorer",
-                "fast-model",
-                "Explore",
-            ))
-            .await
-            .unwrap();
-        let reviewer = store
-            .create_session(AgentSnapshot::fixture_for(
-                "reviewer",
-                "deep-model",
-                "Review",
-            ))
-            .await
-            .unwrap();
-        let explorer_id = explorer.id().to_string();
-        let reviewer_id = reviewer.id().to_string();
-        store
-            .connection
-            .call(move |connection| {
-                connection.execute(
-                    "UPDATE sessions SET updated_at = 100 WHERE id = ?1",
-                    [explorer_id],
-                )?;
-                connection.execute(
-                    "UPDATE sessions SET updated_at = 200 WHERE id = ?1",
-                    [reviewer_id],
-                )?;
-                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
-            })
-            .await
-            .unwrap();
-
-        let sessions = store.sessions().await.unwrap();
-
-        assert_eq!(sessions[0].id(), reviewer.id().to_string());
-        assert_eq!(sessions[0].agent_name(), "reviewer");
-        assert_eq!(sessions[0].model(), "deep-model");
-        assert_eq!(sessions[0].updated_at_ms(), 200);
-        assert_eq!(sessions[1].id(), explorer.id().to_string());
-    }
-
-    #[tokio::test]
-    async fn independent_agents_can_turn_concurrently_without_history_leaks() {
-        let temporary = TempDir::new().unwrap();
-        let path = temporary.path().join("tapet.db");
-        let setup = Store::open(&path).await.unwrap();
-        let explorer = setup
-            .create_session(AgentSnapshot::fixture_for(
-                "explorer",
-                "fast-model",
-                "Explore",
-            ))
-            .await
-            .unwrap();
-        let reviewer = setup
-            .create_session(AgentSnapshot::fixture_for(
-                "reviewer",
-                "deep-model",
-                "Review",
-            ))
-            .await
-            .unwrap();
-        let explorer_store = Store::open(&path).await.unwrap();
-        let reviewer_store = Store::open(&path).await.unwrap();
-
-        let (explorer_call, reviewer_call) = tokio::join!(
-            explorer_store.begin_call(explorer.id(), "Explore this".to_owned()),
-            reviewer_store.begin_call(reviewer.id(), "Review this".to_owned())
-        );
-        let explorer_call = explorer_call.unwrap();
-        let reviewer_call = reviewer_call.unwrap();
-
-        assert_eq!(explorer_call.messages, [Message::user("Explore this")]);
-        assert_eq!(reviewer_call.messages, [Message::user("Review this")]);
-        explorer_store
-            .complete_call(
-                explorer_call.call_id,
-                "Explored".to_owned(),
-                completion("resp_explorer"),
-            )
-            .await
-            .unwrap();
-        reviewer_store
-            .complete_call(
-                reviewer_call.call_id,
-                "Reviewed".to_owned(),
-                completion("resp_reviewer"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            explorer_store.history(explorer.id()).await.unwrap(),
-            [
-                Message::user("Explore this"),
-                Message::assistant("Explored")
-            ]
-        );
-        assert_eq!(
-            reviewer_store.history(reviewer.id()).await.unwrap(),
-            [Message::user("Review this"), Message::assistant("Reviewed")]
-        );
-        assert_eq!(
-            explorer_store
-                .load_session(explorer.id())
-                .await
-                .unwrap()
-                .agent()
-                .model(),
-            "fast-model"
-        );
-        assert_eq!(
-            reviewer_store
-                .load_session(reviewer.id())
-                .await
-                .unwrap()
-                .agent()
-                .model(),
-            "deep-model"
-        );
-    }
-
-    fn completion(response_id: &str) -> Completion {
+    fn completion() -> Completion {
         Completion {
-            provider_response_id: Some(response_id.to_owned()),
-            input_tokens: 1,
+            provider_response_id: Some("resp_test".to_owned()),
+            input_tokens: 3,
             output_tokens: 1,
         }
     }

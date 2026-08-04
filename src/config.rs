@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -12,6 +12,28 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 #[derive(Debug)]
 pub struct Config {
     agents: BTreeMap<String, Agent>,
+    rooms: BTreeMap<String, RoomTemplate>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct RoomTemplate {
+    agents: Vec<String>,
+    description: String,
+    prompt: String,
+}
+
+impl RoomTemplate {
+    pub fn agents(&self) -> &[String] {
+        &self.agents
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -88,6 +110,8 @@ struct RawConfig {
     providers: BTreeMap<String, RawProvider>,
     models: BTreeMap<String, RawModel>,
     agents: BTreeMap<String, RawAgent>,
+    #[serde(default)]
+    rooms: BTreeMap<String, RawRoom>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +143,15 @@ struct RawAgent {
     prompt_file: Option<PathBuf>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRoom {
+    agents: Vec<String>,
+    default: String,
+    description: String,
+    prompt: String,
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     ReadConfig {
@@ -145,6 +178,10 @@ pub enum ConfigError {
         name: String,
         reason: &'static str,
     },
+    InvalidRoom {
+        name: String,
+        reason: &'static str,
+    },
     UnknownProvider {
         model: String,
         provider: String,
@@ -159,6 +196,14 @@ pub enum ConfigError {
         source: io::Error,
     },
     UnknownAgent {
+        name: String,
+        available: Vec<String>,
+    },
+    UnknownRoomAgent {
+        room: String,
+        agent: String,
+    },
+    UnknownRoom {
         name: String,
         available: Vec<String>,
     },
@@ -223,7 +268,70 @@ impl Config {
             );
         }
 
-        Ok(Self { agents })
+        let mut rooms = BTreeMap::new();
+        for (name, raw_room) in raw.rooms {
+            validate_name("room", &name).map_err(|reason| ConfigError::InvalidRoom {
+                name: name.clone(),
+                reason,
+            })?;
+            if raw_room.agents.is_empty() {
+                return Err(ConfigError::InvalidRoom {
+                    name,
+                    reason: "`agents` must contain at least one agent",
+                });
+            }
+            if raw_room.description.trim().is_empty() {
+                return Err(ConfigError::InvalidRoom {
+                    name,
+                    reason: "`description` cannot be empty",
+                });
+            }
+            if raw_room.prompt.trim().is_empty() {
+                return Err(ConfigError::InvalidRoom {
+                    name,
+                    reason: "`prompt` cannot be empty",
+                });
+            }
+            let unique: HashSet<_> = raw_room.agents.iter().collect();
+            if unique.len() != raw_room.agents.len() {
+                return Err(ConfigError::InvalidRoom {
+                    name,
+                    reason: "`agents` cannot contain duplicates",
+                });
+            }
+            for agent in &raw_room.agents {
+                if !agents.contains_key(agent) {
+                    return Err(ConfigError::UnknownRoomAgent {
+                        room: name,
+                        agent: agent.clone(),
+                    });
+                }
+            }
+            if !unique.contains(&raw_room.default) {
+                return Err(ConfigError::InvalidRoom {
+                    name,
+                    reason: "`default` must name an agent in the room",
+                });
+            }
+
+            let mut ordered_agents = vec![raw_room.default.clone()];
+            ordered_agents.extend(
+                raw_room
+                    .agents
+                    .into_iter()
+                    .filter(|agent| agent != &raw_room.default),
+            );
+            rooms.insert(
+                name,
+                RoomTemplate {
+                    agents: ordered_agents,
+                    description: raw_room.description,
+                    prompt: raw_room.prompt,
+                },
+            );
+        }
+
+        Ok(Self { agents, rooms })
     }
 
     pub fn agent(&self, name: &str) -> Result<&Agent, ConfigError> {
@@ -237,6 +345,15 @@ impl Config {
 
     pub fn agents(&self) -> impl Iterator<Item = &Agent> {
         self.agents.values()
+    }
+
+    pub fn room(&self, name: &str) -> Result<&RoomTemplate, ConfigError> {
+        self.rooms
+            .get(name)
+            .ok_or_else(|| ConfigError::UnknownRoom {
+                name: name.to_owned(),
+                available: self.rooms.keys().cloned().collect(),
+            })
     }
 }
 
@@ -297,7 +414,18 @@ fn validate_name(kind: &'static str, name: &str) -> Result<(), &'static str> {
         return Err(match kind {
             "provider" => "provider names cannot be empty",
             "model" => "model names cannot be empty",
-            _ => "agent names cannot be empty",
+            "agent" => "agent names cannot be empty",
+            _ => "room names cannot be empty",
+        });
+    }
+    if matches!(kind, "agent" | "room")
+        && !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+    {
+        return Err(match kind {
+            "agent" => "agent names may contain only ASCII letters, digits, `_`, and `-`",
+            _ => "room names may contain only ASCII letters, digits, `_`, and `-`",
         });
     }
     Ok(())
@@ -371,6 +499,9 @@ impl fmt::Display for ConfigError {
             Self::InvalidAgent { name, reason } => {
                 write!(formatter, "invalid agent `{name}`: {reason}")
             }
+            Self::InvalidRoom { name, reason } => {
+                write!(formatter, "invalid room `{name}`: {reason}")
+            }
             Self::UnknownProvider { model, provider } => write!(
                 formatter,
                 "model `{model}` references unknown provider `{provider}`"
@@ -393,6 +524,17 @@ impl fmt::Display for ConfigError {
             Self::UnknownAgent { name, available } => write!(
                 formatter,
                 "unknown agent `{name}`; available agents: {}",
+                available.join(", ")
+            ),
+            Self::UnknownRoomAgent { room, agent } => {
+                write!(
+                    formatter,
+                    "room `{room}` references unknown agent `{agent}`"
+                )
+            }
+            Self::UnknownRoom { name, available } => write!(
+                formatter,
+                "unknown room template `{name}`; available templates: {}",
                 available.join(", ")
             ),
         }
@@ -528,6 +670,78 @@ mod tests {
     }
 
     #[test]
+    fn resolves_room_templates_with_the_default_agent_first() {
+        let directory = TestDirectory::new();
+        let path = directory.write(
+            "tapet.toml",
+            &configuration(concat!(
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n",
+                "[agents.reviewer]\nmodel = \"primary\"\nprompt = \"Review\"\n",
+                "[rooms.research]\nagents = [\"reviewer\", \"explorer\"]\n",
+                "default = \"explorer\"\n",
+                "description = \"Research room\"\nprompt = \"Cite evidence\"\n",
+            )),
+        );
+
+        let config = Config::load(path).unwrap();
+        let room = config.room("research").unwrap();
+
+        assert_eq!(room.agents(), ["explorer", "reviewer"]);
+        assert_eq!(room.description(), "Research room");
+        assert_eq!(room.prompt(), "Cite evidence");
+    }
+
+    #[test]
+    fn validates_room_template_participants_and_defaults() {
+        let directory = TestDirectory::new();
+        let unknown_agent = directory.write(
+            "unknown-room-agent.toml",
+            &configuration(concat!(
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n",
+                "[rooms.research]\nagents = [\"explorer\", \"missing\"]\n",
+                "default = \"explorer\"\n",
+                "description = \"Research\"\nprompt = \"Cite evidence\"\n",
+            )),
+        );
+        assert!(matches!(
+            Config::load(unknown_agent),
+            Err(ConfigError::UnknownRoomAgent { room, agent })
+                if room == "research" && agent == "missing"
+        ));
+
+        let duplicate = directory.write(
+            "duplicate-room-agent.toml",
+            &configuration(concat!(
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n",
+                "[rooms.research]\nagents = [\"explorer\", \"explorer\"]\n",
+                "default = \"explorer\"\n",
+                "description = \"Research\"\nprompt = \"Cite evidence\"\n",
+            )),
+        );
+        assert!(matches!(
+            Config::load(duplicate),
+            Err(ConfigError::InvalidRoom { reason, .. })
+                if reason == "`agents` cannot contain duplicates"
+        ));
+
+        let invalid_default = directory.write(
+            "invalid-room-default.toml",
+            &configuration(concat!(
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n",
+                "[agents.reviewer]\nmodel = \"primary\"\nprompt = \"Review\"\n",
+                "[rooms.research]\nagents = [\"explorer\"]\n",
+                "default = \"reviewer\"\n",
+                "description = \"Research\"\nprompt = \"Cite evidence\"\n",
+            )),
+        );
+        assert!(matches!(
+            Config::load(invalid_default),
+            Err(ConfigError::InvalidRoom { reason, .. })
+                if reason == "`default` must name an agent in the room"
+        ));
+    }
+
+    #[test]
     fn rejects_invalid_and_unknown_references() {
         let directory = TestDirectory::new();
         let unknown_provider = directory.write(
@@ -603,6 +817,18 @@ mod tests {
             Config::load(no_prompt),
             Err(ConfigError::InvalidAgent { reason, .. })
                 if reason == "exactly one of `prompt` or `prompt_file` is required"
+        ));
+
+        let unmentionable_name = directory.write(
+            "unmentionable-agent.toml",
+            &configuration(
+                "[agents.\"research lead\"]\nmodel = \"primary\"\nprompt = \"Explore\"\n",
+            ),
+        );
+        assert!(matches!(
+            Config::load(unmentionable_name),
+            Err(ConfigError::InvalidAgent { reason, .. })
+                if reason == "agent names may contain only ASCII letters, digits, `_`, and `-`"
         ));
     }
 

@@ -10,8 +10,23 @@ model = "gpt-5.6-sol"
 
 [agents.explorer]
 model = "gpt-sol"
-prompt = "Explore the world and beyond. Make no mistakes."
+prompt = "Generate promising possibilities, uncover useful context, and clearly mark uncertain claims."
 
-[agents.shouter]
+[agents.doubter]
 model = "gpt-sol"
-prompt = "Respond always in all caps"
+prompt = "Stress-test claims, expose hidden assumptions, and present the strongest reasonable counterargument."
+
+[agents.synthesizer]
+model = "gpt-sol"
+prompt = "Combine the strongest surviving ideas into a clear conclusion, preserving important disagreements and open questions."
+
+[rooms.research]
+agents = ["explorer", "doubter", "synthesizer"]
+default = "explorer"
+description = "Explore possibilities, challenge assumptions, and synthesize what survives."
+prompt = """
+Treat every contribution as a proposal that may be challenged.
+Distinguish evidence from speculation.
+Refer to other participants by name when responding to their arguments.
+Keep unresolved disagreements and open questions visible.
+"""
