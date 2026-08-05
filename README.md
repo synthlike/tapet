@@ -12,6 +12,8 @@ select specific participants with `@agent` mentions.
 The name recalls the green tablecloth around which people gathered to debate
 ideas and solve problems.
 
+![Tapet room with explorer, doubter, and synthesizer agents](screenshots/tapet.png)
+
 ## Usage
 
 Configure providers, model aliases, and agents in `tapet.toml`, then export the
@@ -28,17 +30,6 @@ tapet room --with explorer --with doubter
 tapet room --from research       # research is template defined in tapet.toml
 tapet enter room_...             # resume a room
 tapet history room_...           # print room history
-```
-
-While in a room, you can explicitly select agents with mentions:
-
-```text
-you> @explorer propose two approaches
-explorer> ...
-you> @doubter critique the proposal
-doubter> ...
-you> @synthesizer reconcile the strongest points
-synthesizer> ...
 ```
 
 ## Configuration

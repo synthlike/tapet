@@ -6,9 +6,11 @@ mod room;
 mod store;
 mod stream;
 mod terminal;
+mod ui;
 
 use agent::AgentSnapshot;
 use config::{Agent, Config, ConfigError};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use message::Message;
 use openai::{OpenAiClient, ProviderError};
@@ -18,7 +20,7 @@ use room::{
 };
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process;
 use store::{Store, StoreError};
@@ -26,6 +28,7 @@ use stream::{Completion, StreamEvent};
 use terminal::InputSuppression;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+use ui::{InputAction, RoomUi, TerminalUi};
 
 const CONFIG_PATH: &str = "tapet.toml";
 const DATABASE_PATH: &str = ".tapet/tapet.db";
@@ -168,23 +171,35 @@ async fn try_main() -> Result<(), AppError> {
             validate_participants(&participants)?;
             let store = Store::open(DATABASE_PATH).await?;
             let room = store.create_room(participants, description, prompt).await?;
-            let input = BufReader::new(tokio::io::stdin());
-            let stdout = io::stdout();
-            let mut output = stdout.lock();
-            writeln!(output, "Starting new room: {}", room.id())?;
-            write_room_ready(&room, &mut output)?;
-            run_room(store, room, input, output).await?;
+            if has_interactive_terminal() {
+                let id = room.id().to_string();
+                run_room_ui(store, room, Vec::new()).await?;
+                println!("Room saved: {id}");
+            } else {
+                let input = BufReader::new(tokio::io::stdin());
+                let stdout = io::stdout();
+                let mut output = stdout.lock();
+                writeln!(output, "Starting new room: {}", room.id())?;
+                write_room_ready(&room, &mut output)?;
+                run_room(store, room, input, output).await?;
+            }
         }
         Command::Enter { room: id } => {
             let store = Store::open(DATABASE_PATH).await?;
-            let stdout = io::stdout();
-            let mut output = stdout.lock();
             let room = store.load_room(&id).await?;
             let messages = store.room_history(&id).await?;
-            let input = BufReader::new(tokio::io::stdin());
-            writeln!(output, "Room {}", room.id())?;
-            write_room_history(&messages, &mut output)?;
-            run_room(store, room, input, output).await?;
+            if has_interactive_terminal() {
+                let id = room.id().to_string();
+                run_room_ui(store, room, messages).await?;
+                println!("Room saved: {id}");
+            } else {
+                let input = BufReader::new(tokio::io::stdin());
+                let stdout = io::stdout();
+                let mut output = stdout.lock();
+                writeln!(output, "Room {}", room.id())?;
+                write_room_history(&messages, &mut output)?;
+                run_room(store, room, input, output).await?;
+            }
         }
         Command::History { room: id } => {
             let store = Store::open(DATABASE_PATH).await?;
@@ -197,6 +212,10 @@ async fn try_main() -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+fn has_interactive_terminal() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
 fn write_agents<'a>(
@@ -238,6 +257,216 @@ fn write_room_history(messages: &[RoomMessage], output: &mut impl Write) -> io::
         writeln!(output, "{speaker}> {}", message.visible_content())?;
     }
     Ok(())
+}
+
+async fn run_room_ui(store: Store, room: Room, messages: Vec<RoomMessage>) -> Result<(), AppError> {
+    let mut terminal = TerminalUi::start()?;
+    let mut terminal_events = EventStream::new();
+    let mut state = RoomUi::new(&room, messages);
+
+    loop {
+        terminal.draw(&mut state)?;
+        let event = next_terminal_event(&mut terminal_events).await?;
+        match state.handle_event(event) {
+            InputAction::None => {}
+            InputAction::Exit => return Ok(()),
+            InputAction::Submit(message) => {
+                if run_room_ui_turn(
+                    &store,
+                    &room,
+                    message,
+                    &mut terminal,
+                    &mut terminal_events,
+                    &mut state,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn run_room_ui_turn(
+    store: &Store,
+    room: &Room,
+    message: String,
+    terminal: &mut TerminalUi,
+    terminal_events: &mut EventStream,
+    state: &mut RoomUi,
+) -> Result<bool, AppError> {
+    let room_message = RoomMessage::user(message);
+    let targets = match room.route(&room_message) {
+        Ok(targets) => targets
+            .into_iter()
+            .map(|participant| participant.agent_name().to_owned())
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            state.set_error(error.to_string());
+            return Ok(false);
+        }
+    };
+
+    state.set_status("Saving message...");
+    terminal.draw(state)?;
+    let appended = store
+        .append_room_user_message(room.id(), room_message.content().to_owned())
+        .await?;
+    state.push_message(room_message);
+    let provider_messages = appended
+        .messages
+        .iter()
+        .map(RoomMessage::as_provider_message)
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+
+    for target in targets {
+        let participant = room
+            .participant(&target)
+            .expect("room routing only returns participants");
+        state.begin_response(&target);
+        terminal.draw(state)?;
+        let call_id = store
+            .begin_room_call(room.id(), &target, appended.message_id)
+            .await?;
+        let client = match OpenAiClient::from_settings(
+            participant.base_url(),
+            participant.api_key_env(),
+            participant.model(),
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                store.fail_room_call(call_id, error.to_string()).await?;
+                state.discard_response();
+                failures.push(format!("@{target}: {error}"));
+                continue;
+            }
+        };
+        let instructions = room_instructions(room, participant);
+        let outcome = stream_room_response_ui(
+            &target,
+            &instructions,
+            &client,
+            &provider_messages,
+            terminal,
+            terminal_events,
+            state,
+        )
+        .await;
+
+        match outcome {
+            Ok(Some(response)) => {
+                store
+                    .complete_room_call(call_id, response.text.clone(), response.completion)
+                    .await?;
+                state.finish_response(&target, response.text);
+            }
+            Ok(None) => {
+                store
+                    .fail_room_call(call_id, "cancelled by user".to_owned())
+                    .await?;
+                state.discard_response();
+                return Ok(true);
+            }
+            Err(error) => {
+                store.fail_room_call(call_id, error.to_string()).await?;
+                state.discard_response();
+                failures.push(format!("@{target}: {error}"));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        state.set_status("Ready");
+    } else {
+        state.set_error(failures.join("; "));
+    }
+    Ok(false)
+}
+
+async fn stream_room_response_ui(
+    agent_name: &str,
+    system_prompt: &str,
+    client: &OpenAiClient,
+    messages: &[Message],
+    terminal: &mut TerminalUi,
+    terminal_events: &mut EventStream,
+    state: &mut RoomUi,
+) -> Result<Option<AssistantResponse>, AppError> {
+    let request = client.stream(system_prompt, messages);
+    tokio::pin!(request);
+    let mut events = loop {
+        tokio::select! {
+            result = &mut request => break result?,
+            event = next_terminal_event(terminal_events) => {
+                let event = event?;
+                if is_exit_event(&event) {
+                    return Ok(None);
+                }
+                state.handle_passive_event(&event);
+                terminal.draw(state)?;
+            }
+        }
+    };
+    let mut filter = LeadingAttributionFilter::new(agent_name);
+    let mut message = String::new();
+
+    loop {
+        tokio::select! {
+            event = events.next() => {
+                match event {
+                    Some(Ok(StreamEvent::TextDelta(delta))) => {
+                        let visible = filter.push(&delta);
+                        if !visible.is_empty() {
+                            message.push_str(&visible);
+                            state.push_response_delta(&visible);
+                            terminal.draw(state)?;
+                        }
+                    }
+                    Some(Ok(StreamEvent::Completed(completion))) => {
+                        let visible = filter.finish();
+                        if !visible.is_empty() {
+                            message.push_str(&visible);
+                            state.push_response_delta(&visible);
+                            terminal.draw(state)?;
+                        }
+                        return Ok(Some(AssistantResponse { text: message, completion }));
+                    }
+                    Some(Err(error)) => return Err(error.into()),
+                    None => return Err(ProviderError::IncompleteStream.into()),
+                }
+            }
+            event = next_terminal_event(terminal_events) => {
+                let event = event?;
+                if is_exit_event(&event) {
+                    return Ok(None);
+                }
+                state.handle_passive_event(&event);
+                terminal.draw(state)?;
+            }
+        }
+    }
+}
+
+async fn next_terminal_event(events: &mut EventStream) -> io::Result<Event> {
+    match events.next().await {
+        Some(event) => event,
+        None => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "terminal event stream ended",
+        )),
+    }
+}
+
+fn is_exit_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+    )
 }
 
 async fn run_room(
