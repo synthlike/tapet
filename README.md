@@ -71,18 +71,3 @@ Refer to other participants by name when responding to their arguments.
 Keep unresolved disagreements and open questions visible.
 """
 ```
-
-## Example
-
-```text
-$ tapet room --from research
-Starting new room: room_eb89dcce80d54d92933b37f8492747d9
-room> Explore possibilities, challenge assumptions, and synthesize what survives.
-room> ready (@explorer, @doubter, @synthesizer)
-you> What's the best month of the year?
-explorer> My vote is October: mild weather, autumn colors, fewer peak-season crowds, and plenty of seasonal food and festivals. That said, “best” depends on location and priorities—June might win for long days, while December wins for celebrations.
-you> @doubter you?
-doubter> I’d challenge the premise that there’s a universal “best.” If forced, I’d pick May: long days, moderate weather, and fewer peak-season crowds in much of the Northern Hemisphere. But @explorer’s October case is equally location-dependent—October can mean cold rain or springtime elsewhere.
-you> @synthesizer thoughts?
-synthesizer> There’s no universal best month; climate, hemisphere, and priorities decide it. @explorer makes a strong case for October’s autumn colors, mild weather, and festivals, while @doubter favors May for long days and moderate temperatures. My synthesis: **May is best for daylight and spring energy; October is best for atmosphere and seasonal character.** If forced to choose, I’d narrowly pick October—but that’s preference, not objective fact.
-```
