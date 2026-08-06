@@ -20,70 +20,23 @@ ideas and solve problems.
 Configure providers, model aliases, and agents in `tapet.toml`, then export the
 API-key environment variable named by the provider.
 
-You can interact with agents either via one-shot questions, like:
 ```sh
-tapet ask explorer "What's out there?"
+tapet ask explorer "What's out there?"          # one-shot question
+
+tapet room --with explorer --with doubter       # ad-hoc room
+tapet room --from research --name moon-lab      # from a tapet.toml template
+tapet enter moon-lab                            # resume a room
+tapet history moon-lab                          # print room history
 ```
 
-Or by creating "rooms" with one or more agents:
-```sh
-tapet room --with explorer --with doubter
-tapet room --from research       # research is template defined in tapet.toml
-tapet room --from research --name moon-lab
-tapet enter sweaty-warroom       # resume a room
-tapet history sweaty-warroom     # print room history
-```
+Rooms default to their first (or default) agent; address others with
+`@agent`, or `@all` to broadcast. Interactive rooms support scrollback,
+input history, and Tab completion for `@agent` mentions and `/` commands.
 
-Without `--name`, Tapet generates a memorable adjective–place name such as
-`sweaty-warroom`, `haunted-basement`, or `caffeinated-moonbase`. Custom names
-must contain at most 64 lowercase letters, numbers, and single hyphens. Names
-must be unique within the local Tapet database.
-
-Interactive rooms support mouse-wheel scrollback, Up/Down input history, and
-Tab completion for `@agent` mentions and `/` commands.
-
-## Working with workspace files
-
-Room agents can request the `read_file`, `list_files`, and `write_file` tools
-when they need source context or want to make a change. Tapet pauses before
-every use and shows what's being requested:
-
-```text
-@explorer wants to read src/main.rs
-The file contents will be sent to the model.
-
-[y] Allow once    [n] Deny
-```
-
-`write_file` shows a diff against the current file (or the whole file as
-additions, for a new one) instead of just a path, so you can see the change
-before approving it:
-
-```text
-@explorer wants to write src/main.rs
-This overwrites the file on disk.
-
-  fn main() {
--     println!("hello");
-+     println!("hello, world");
-  }
-
-[y] Allow once    [n] Deny
-```
-
-An approval applies to that call only. Paths must be relative to the current
-workspace; traversal, paths outside the workspace, `.git`, `.tapet`, `.env`
-files, and common private-key formats are rejected. `read_file` and
-`write_file` reject non-UTF-8 content and content over 128 KiB; `write_file`
-also requires the parent directory to already exist (Tapet never creates
-directories implicitly) and refuses to overwrite a directory. `list_files`
-lists a single directory's immediate entries (non-recursive) and rejects
-directories with more than 500 entries. Redirected input or output disables
-execution because Tapet cannot ask for interactive approval.
-
-Tapet records the tool name, arguments, decision, status, and result size in
-SQLite for auditing. File contents, diffs, and directory listings are sent to
-the selected model after approval but are not stored in the database.
+Agents may also request the `read_file`, `list_files`, and `write_file` tools
+to inspect or change the workspace — `write_file` shows a diff to approve
+before anything is written. Every use pauses for a `[y]/[n]` approval and is
+logged to SQLite for auditing; nothing runs when input or output is redirected.
 
 ## Configuration
 
