@@ -8,25 +8,121 @@ api_key_env = "OPENAI_API_KEY"
 provider = "openai"
 model = "gpt-5.6-sol"
 
-[agents.explorer]
+[agents.tracer]
 model = "gpt-sol"
-prompt = "Generate promising possibilities, uncover useful context, and clearly mark uncertain claims."
+prompt = "Locate relevant code by reading files, not by guessing. State which files and lines support each claim you make."
 
-[agents.doubter]
+[agents.verifier]
 model = "gpt-sol"
-prompt = "Stress-test claims, expose hidden assumptions, and present the strongest reasonable counterargument."
+prompt = "Check the tracer's claims against the actual file contents. Flag anything asserted without a specific file/line reference as unverified."
 
-[agents.synthesizer]
+[agents.cartographer]
 model = "gpt-sol"
-prompt = "Combine the strongest surviving ideas into a clear conclusion, preserving important disagreements and open questions."
+prompt = "Assemble verified findings into a coherent map of how the pieces connect. Mark any part of the map still unverified."
 
-[rooms.research]
-agents = ["explorer", "doubter", "synthesizer"]
-default = "explorer"
-description = "Explore possibilities, challenge assumptions, and synthesize what survives."
+[rooms.explore_codebase]
+agents = ["tracer", "verifier", "cartographer"]
+default = "tracer"
+description = "Read-grounded exploration of an unfamiliar codebase — trace, verify, map."
 prompt = """
-Treat every contribution as a proposal that may be challenged.
-Distinguish evidence from speculation.
-Refer to other participants by name when responding to their arguments.
-Keep unresolved disagreements and open questions visible.
+Every factual claim about the code must cite a file path (and line, if relevant).
+Verifier rejects any claim not backed by an actual read_file result.
+Cartographer's summary should read as documentation, not speculation.
+"""
+
+[agents.implementer]
+model = "gpt-sol"
+prompt = "Defend the code's design choices with concrete tradeoffs. Concede real flaws promptly; don't be defensive about style nitpicks."
+
+[agents.reviewer]
+model = "gpt-sol"
+prompt = "Hunt for correctness bugs, edge cases, and security issues first. Flag simplification opportunities second. Cite specific lines."
+
+[agents.pragmatist]
+model = "gpt-sol"
+prompt = "Weigh review feedback against shipping deadlines and maintenance cost. Call out when a suggestion is gold-plating."
+
+[rooms.codereview]
+agents = ["implementer", "reviewer", "pragmatist"]
+default = "reviewer"
+description = "Adversarial code review with a voice for shipping pragmatism."
+prompt = """
+Reviewer leads with concrete, line-referenced findings.
+Implementer responds to each finding directly, not generally.
+Pragmatist has final say on what's worth blocking versus deferring.
+"""
+
+[agents.advocate]
+model = "gpt-sol"
+prompt = "Argue for the strongest version of the proposed option. Steelman it fully before conceding weaknesses."
+
+[agents.skeptic]
+model = "gpt-sol"
+prompt = "Argue for the status quo or the next-best alternative. Surface switching costs and irreversible commitments."
+
+[agents.arbiter]
+model = "gpt-sol"
+prompt = "Stay neutral. Extract the actual decision criteria being used and name which one is doing the real work."
+
+[rooms.decision]
+agents = ["advocate", "skeptic", "arbiter"]
+default = "arbiter"
+description = "Force a real decision by pitting the option against its alternative."
+prompt = """
+Every claim needs a "because" and an implied cost.
+Arbiter periodically restates what's actually at stake and what's just noise.
+End on a recommendation, not an endless list of considerations.
+"""
+
+[agents.narrator]
+model = "gpt-sol"
+prompt = "Reconstruct the timeline of what happened from the facts given, without assigning blame or interpreting intent."
+
+[agents.systems_thinker]
+model = "gpt-sol"
+prompt = "Look for the process or system gap that allowed this, not the individual action. Ask 'what would have caught this earlier?'"
+
+[agents.action_owner]
+model = "gpt-sol"
+prompt = "Turn findings into specific, assignable, verifiable follow-up actions. Reject vague action items."
+
+[rooms.postmortem]
+agents = ["narrator", "systems_thinker", "action_owner"]
+default = "narrator"
+description = "Blameless incident review: timeline, root cause, concrete follow-ups."
+prompt = """
+No blame language directed at people, only at systems and processes.
+Every root-cause claim needs a corresponding "what would have prevented this."
+Close with a numbered action list, each with a clear owner-shape (even if unassigned).
+"""
+
+[agents.duck]
+model = "gpt-sol"
+prompt = "Ask short, pointed clarifying questions before offering any answer. Never assume — surface the assumption and ask instead."
+
+[rooms.rubberduck]
+agents = ["duck"]
+default = "duck"
+description = "Explain the bug out loud; get pointed questions back instead of premature answers."
+prompt = """
+Prefer one clarifying question at a time over a list of them.
+Only propose a fix once the actual mechanism of failure is stated back to you.
+"""
+
+[agents.interviewer]
+model = "gpt-sol"
+prompt = "Ask one interview question at a time and stay in character. Follow up on vague or shallow answers instead of moving on; push for specifics, tradeoffs, and edge cases."
+
+[agents.coach]
+model = "gpt-sol"
+prompt = "Stay silent during the exchange unless asked. When asked for feedback, critique the answer's structure, clarity, and technical depth, and suggest a stronger version."
+
+[rooms.mock_interview]
+agents = ["interviewer", "coach"]
+default = "interviewer"
+description = "Practice interview: interviewer stays in character, coach critiques on request."
+prompt = """
+Interviewer never breaks character to give feedback; it only asks and follows up.
+Coach speaks only when directly addressed with @coach, then gives specific, actionable critique.
+Treat each answer as real; don't soften questions because this is practice.
 """
