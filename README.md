@@ -65,7 +65,9 @@ Agents may also request the `read_file`, `list_files`, `write_file`, and
 `search_files` does a literal, case-sensitive substring search across a
 directory (skipping `.git`, build/dependency directories, and binary files).
 Every use pauses for a `[y]/[n]` approval and is logged to SQLite for
-auditing; nothing runs when input or output is redirected.
+auditing; nothing runs when input or output is redirected — unless the room
+grants that agent the tool's category (see `permissions` below), in which
+case it runs immediately with a notice instead of a prompt.
 
 ## Configuration
 
@@ -105,4 +107,23 @@ Distinguish evidence from speculation.
 Refer to other participants by name when responding to their arguments.
 Keep unresolved disagreements and open questions visible.
 """
+```
+
+A room template can optionally grant each participant a set of tool
+categories — `read` (`read_file`, `list_files`, `search_files`) and `write`
+(`write_file`); `call` and `exec` are reserved for future tools. A granted
+category runs without an approval prompt (just a notice); an agent omitted
+from the table gets no tools at all. Omitting `permissions` entirely keeps
+today's behavior — every tool offered, every call still prompts:
+
+```toml
+[rooms.build]
+agents = ["architect", "dev"]
+default = "architect"
+description = "Ship a feature end to end."
+prompt = "Architect plans, dev builds."
+
+[rooms.build.permissions]
+architect = ["read"]
+dev = ["read", "write"]
 ```

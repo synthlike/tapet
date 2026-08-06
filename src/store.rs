@@ -1,5 +1,5 @@
 use crate::agent::AgentSnapshot;
-use crate::config::ProviderKind;
+use crate::config::{Permission, ProviderKind};
 use crate::room::{Room, RoomId, RoomMessage, RoomName};
 use crate::stream::Completion;
 use crate::stream::ToolCall;
@@ -11,11 +11,12 @@ use time::OffsetDateTime;
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::rusqlite::{self, TransactionBehavior, params};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_RANDOM_ROOM_ATTEMPTS: usize = 64;
 const MIGRATION_001: &str = include_str!("../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_tool_calls.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_room_names.sql");
+const MIGRATION_004: &str = include_str!("../migrations/004_participant_permissions.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -53,6 +54,7 @@ impl Store {
                         transaction.execute_batch(MIGRATION_001)?;
                         transaction.execute_batch(MIGRATION_002)?;
                         transaction.execute_batch(MIGRATION_003)?;
+                        transaction.execute_batch(MIGRATION_004)?;
                         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                         transaction.commit()
                     })
@@ -64,6 +66,7 @@ impl Store {
                         let transaction = connection.transaction()?;
                         transaction.execute_batch(MIGRATION_002)?;
                         transaction.execute_batch(MIGRATION_003)?;
+                        transaction.execute_batch(MIGRATION_004)?;
                         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                         transaction.commit()
                     })
@@ -74,6 +77,17 @@ impl Store {
                     .call(|connection| {
                         let transaction = connection.transaction()?;
                         transaction.execute_batch(MIGRATION_003)?;
+                        transaction.execute_batch(MIGRATION_004)?;
+                        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                        transaction.commit()
+                    })
+                    .await?;
+            }
+            3 => {
+                connection
+                    .call(|connection| {
+                        let transaction = connection.transaction()?;
+                        transaction.execute_batch(MIGRATION_004)?;
                         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                         transaction.commit()
                     })
@@ -166,8 +180,8 @@ impl Store {
                     transaction.execute(
                         "INSERT INTO room_participants (
                             room_id, agent_name, provider_kind, base_url, api_key_env,
-                            model, system_prompt, position
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            model, system_prompt, position, permissions
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                         params![
                             stored_id,
                             participant.agent_name(),
@@ -177,6 +191,7 @@ impl Store {
                             participant.model(),
                             participant.system_prompt(),
                             i64::try_from(position).expect("participant position fits in i64"),
+                            stored_permissions(participant.permissions()),
                         ],
                     )?;
                 }
@@ -283,8 +298,8 @@ impl Store {
                 transaction.execute(
                     "INSERT INTO room_participants (
                         room_id, agent_name, provider_kind, base_url, api_key_env,
-                        model, system_prompt, position
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        model, system_prompt, position, permissions
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         stored_id,
                         participant.agent_name(),
@@ -294,6 +309,7 @@ impl Store {
                         participant.model(),
                         participant.system_prompt(),
                         next_position,
+                        stored_permissions(participant.permissions()),
                     ],
                 )?;
                 transaction.execute(
@@ -635,7 +651,8 @@ fn query_room_participants(
     room_id: &str,
 ) -> rusqlite::Result<Vec<AgentSnapshot>> {
     let mut statement = connection.prepare(
-        "SELECT agent_name, provider_kind, base_url, api_key_env, model, system_prompt
+        "SELECT agent_name, provider_kind, base_url, api_key_env, model, system_prompt,
+                permissions
          FROM room_participants WHERE room_id = ?1 ORDER BY position ASC",
     )?;
     statement
@@ -643,6 +660,7 @@ fn query_room_participants(
             let stored_kind: String = row.get(1)?;
             let provider_kind =
                 ProviderKind::from_stored(&stored_kind).ok_or(rusqlite::Error::InvalidQuery)?;
+            let stored_permissions: Option<String> = row.get(6)?;
             Ok(AgentSnapshot::from_stored(
                 row.get(0)?,
                 provider_kind,
@@ -650,9 +668,39 @@ fn query_room_participants(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                parse_stored_permissions(stored_permissions.as_deref())
+                    .ok_or(rusqlite::Error::InvalidQuery)?,
             ))
         })?
         .collect()
+}
+
+/// `None` is stored as NULL (unrestricted); `Some(categories)` is stored as
+/// a comma-separated list, e.g. `"read,write"`.
+fn stored_permissions(permissions: Option<&[Permission]>) -> Option<String> {
+    permissions.map(|categories| {
+        categories
+            .iter()
+            .map(|category| category.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+/// Returns `None` (outer) only on a malformed stored value; `Some(None)`
+/// (unrestricted) or `Some(Some(categories))` otherwise.
+fn parse_stored_permissions(value: Option<&str>) -> Option<Option<Vec<Permission>>> {
+    let Some(value) = value else {
+        return Some(None);
+    };
+    if value.is_empty() {
+        return Some(Some(Vec::new()));
+    }
+    value
+        .split(',')
+        .map(Permission::from_stored)
+        .collect::<Option<Vec<_>>>()
+        .map(Some)
 }
 
 fn query_room_messages(
@@ -723,6 +771,7 @@ pub enum StoreError {
 mod tests {
     use super::{Store, StoreError};
     use crate::agent::AgentSnapshot;
+    use crate::config::Permission;
     use crate::room::{RoomMessage, RoomName};
     use crate::stream::Completion;
     use tempfile::TempDir;
@@ -859,6 +908,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_trips_participant_permissions() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("tapet.db");
+        let store = Store::open(&path).await.unwrap();
+        let unrestricted = AgentSnapshot::fixture_for("architect", "fast-model", "Plan");
+        let granted = AgentSnapshot::fixture_with_permissions(
+            "dev",
+            vec![Permission::Read, Permission::Write],
+        );
+        let locked_out = AgentSnapshot::fixture_with_permissions("tester", Vec::new());
+
+        let room = store
+            .create_room(
+                None,
+                vec![unrestricted.clone(), granted.clone(), locked_out.clone()],
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+
+        let reopened = Store::open(&path).await.unwrap();
+        let loaded = reopened.load_room(room.name()).await.unwrap();
+        assert_eq!(loaded.participants(), [unrestricted, granted, locked_out]);
+        assert!(loaded.participants()[0].permissions().is_none());
+        assert_eq!(
+            loaded.participants()[1].permissions(),
+            Some([Permission::Read, Permission::Write].as_slice())
+        );
+        assert_eq!(loaded.participants()[2].permissions(), Some([].as_slice()));
+    }
+
+    #[tokio::test]
     async fn lists_rooms_most_recently_updated_first() {
         let temporary = TempDir::new().unwrap();
         let store = Store::open(temporary.path().join("tapet.db"))
@@ -939,14 +1021,14 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let path = temporary.path().join("tapet.db");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 4).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
         drop(connection);
 
         assert!(matches!(
             Store::open(path).await,
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 4,
-                supported: 3
+                found: 5,
+                supported: 4
             })
         ));
     }
@@ -977,7 +1059,7 @@ mod tests {
         assert_eq!(journal_mode, "wal");
         assert!(foreign_keys);
         assert_eq!(busy_timeout, 5_000);
-        assert_eq!(user_version, 3);
+        assert_eq!(user_version, 4);
     }
 
     #[tokio::test]
@@ -1006,7 +1088,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert!(tool_calls_exists);
     }
 
@@ -1037,8 +1119,40 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert!(name_column_exists);
+    }
+
+    #[tokio::test]
+    async fn migrates_version_three_databases() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("tapet.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(super::MIGRATION_001).unwrap();
+        connection.execute_batch(super::MIGRATION_002).unwrap();
+        connection.execute_batch(super::MIGRATION_003).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        drop(connection);
+
+        let store = Store::open(path).await.unwrap();
+        let (version, permissions_column_exists) = store
+            .connection
+            .call(|connection| {
+                let version = connection
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+                let exists = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('room_participants')
+                     WHERE name = 'permissions')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>((version, exists))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(version, 4);
+        assert!(permissions_column_exists);
     }
 
     #[tokio::test]

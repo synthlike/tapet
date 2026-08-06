@@ -10,7 +10,7 @@ mod tool;
 mod ui;
 
 use agent::AgentSnapshot;
-use config::{Agent, Config, ConfigError, RoomTemplate};
+use config::{Agent, Config, ConfigError, Permission, RoomTemplate};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use message::Message;
@@ -58,6 +58,12 @@ agents = ["assistant"]
 default = "assistant"
 description = "General-purpose chat room."
 prompt = "Be concise and helpful."
+
+# Optional: grant tool categories per participant so their calls run
+# immediately (with a notice) instead of prompting for [y]/[n] each time.
+# Remove this table, or omit an agent from it, to require approval as usual.
+[rooms.chat.permissions]
+assistant = ["read", "write"]
 
 # Add more [agents.*] and [rooms.*] as needed. See
 # https://github.com/synthlike/tapet for a full example with multiple
@@ -260,20 +266,28 @@ async fn try_main() -> Result<(), AppError> {
         }
         Command::Room { source, name } => {
             let config = Config::load(&config_path)?;
-            let (agent_names, description, prompt) = match source {
-                RoomSource::With(agents) => (agents, String::new(), String::new()),
+            let (agent_names, description, prompt, permissions) = match source {
+                RoomSource::With(agents) => (agents, String::new(), String::new(), None),
                 RoomSource::From(template) => {
                     let template = config.room(&template)?;
                     (
                         template.agents().to_vec(),
                         template.description().to_owned(),
                         template.prompt().to_owned(),
+                        template.permissions().cloned(),
                     )
                 }
             };
             let participants = agent_names
                 .iter()
-                .map(|name| config.agent(name).map(AgentSnapshot::resolve))
+                .map(|name| {
+                    let granted = permissions
+                        .as_ref()
+                        .map(|table| table.get(name).cloned().unwrap_or_default());
+                    config
+                        .agent(name)
+                        .map(|agent| AgentSnapshot::resolve(agent, granted))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             validate_participants(&participants)?;
             let store = Store::open(DATABASE_PATH).await?;
@@ -472,7 +486,9 @@ async fn add_room_participant_ui(
             return Ok(());
         }
     };
-    let participant = AgentSnapshot::resolve(agent);
+    // Agents added mid-session have no room-template permissions table to
+    // consult, so they always join unrestricted (matches today's behavior).
+    let participant = AgentSnapshot::resolve(agent, None);
 
     match store
         .add_room_participant(room.id(), participant.clone())
@@ -550,13 +566,17 @@ async fn run_room_ui_turn(
                 terminal_events,
                 state,
             };
+            let context = RoomCallContext {
+                store,
+                room_call_id: call_id,
+                permissions: participant.permissions(),
+            };
             stream_room_response_ui(
                 &target,
                 &instructions,
                 &client,
                 &provider_messages,
-                store,
-                call_id,
+                &context,
                 &mut active_ui,
             )
             .await
@@ -598,15 +618,25 @@ struct ActiveRoomUi<'a> {
     state: &'a mut RoomUi,
 }
 
+/// Per-turn context threaded through a single model call: where to persist
+/// it and what the calling participant is permitted to do without a prompt.
+struct RoomCallContext<'a> {
+    store: &'a Store,
+    room_call_id: i64,
+    permissions: Option<&'a [Permission]>,
+}
+
 async fn stream_room_response_ui(
     agent_name: &str,
     system_prompt: &str,
     client: &OpenAiClient,
     messages: &[Message],
-    store: &Store,
-    room_call_id: i64,
+    context: &RoomCallContext<'_>,
     ui: &mut ActiveRoomUi<'_>,
 ) -> Result<Option<AssistantResponse>, AppError> {
+    let store = context.store;
+    let room_call_id = context.room_call_id;
+    let permissions = context.permissions;
     let mut input = ToolInput::from_messages(messages)?;
     let mut usage = Completion {
         provider_response_id: None,
@@ -617,7 +647,8 @@ async fn stream_room_response_ui(
     loop {
         let tools_enabled = tool_calls < MAX_TOOL_CALLS_PER_TURN;
         let events = {
-            let request = client.stream_with_tools(system_prompt, &input, tools_enabled);
+            let request =
+                client.stream_with_tools(system_prompt, &input, tools_enabled, permissions);
             tokio::pin!(request);
             loop {
                 tokio::select! {
@@ -661,7 +692,9 @@ async fn stream_room_response_ui(
                 continue;
             }
             tool_calls += 1;
-            let Some(output) = run_tool_ui(agent_name, &call, record_id, store, ui).await? else {
+            let Some(output) =
+                run_tool_ui(agent_name, &call, record_id, store, permissions, ui).await?
+            else {
                 return Ok(None);
             };
             input.append_function_output(&call.call_id, output);
@@ -730,6 +763,7 @@ async fn run_tool_ui(
     call: &ToolCall,
     record_id: i64,
     store: &Store,
+    permissions: Option<&[Permission]>,
     ui: &mut ActiveRoomUi<'_>,
 ) -> Result<Option<String>, AppError> {
     let request = match ToolRequest::parse(&call.name, &call.arguments) {
@@ -743,6 +777,20 @@ async fn run_tool_ui(
     };
     let verb = request.verb();
     let path = request.display_path();
+
+    // A room with a permissions table should never even offer a category an
+    // agent lacks, so this only fires on a stale/hallucinated call — reject
+    // it outright rather than falling back to an approval prompt.
+    if let Some(granted) = permissions
+        && !granted.contains(&request.permission())
+    {
+        let error = format!("@{agent_name} is not permitted to {verb}");
+        store.fail_tool_call(record_id, error.clone()).await?;
+        ui.state.push_tool_notice(format!("✗ {error}"));
+        return Ok(Some(error_output(&error)));
+    }
+    let auto_approved = permissions.is_some();
+
     let workspace = env::current_dir()?;
     let preview = match request.approval_preview(&workspace) {
         Ok(preview) => preview,
@@ -753,45 +801,52 @@ async fn run_tool_ui(
             return Ok(Some(error_output(&error)));
         }
     };
-    ui.state.request_tool_approval(agent_name, preview);
-    ui.terminal.draw(ui.state)?;
 
-    let approved = loop {
-        let event = next_terminal_event(ui.terminal_events).await?;
-        if is_exit_event(&event) {
-            ui.state.clear_tool_approval();
-            store
-                .fail_tool_call(record_id, "cancelled by user".to_owned())
-                .await?;
-            return Ok(None);
-        }
-        match &event {
-            Event::Key(key)
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) =>
-            {
-                break true;
-            }
-            Event::Key(key)
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N')) =>
-            {
-                break false;
-            }
-            _ => {
-                ui.state.handle_passive_event(&event);
-                ui.terminal.draw(ui.state)?;
-            }
-        }
-    };
-    ui.state.clear_tool_approval();
-
-    if !approved {
-        store.deny_tool_call(record_id).await?;
+    if auto_approved {
         ui.state
-            .push_tool_notice(format!("○ @{agent_name} {verb} {path} · denied"));
+            .push_tool_notice(format!("✓ auto-approved @{agent_name} {verb} {path}"));
         ui.terminal.draw(ui.state)?;
-        return Ok(Some(error_output(&"user denied file access")));
+    } else {
+        ui.state.request_tool_approval(agent_name, preview);
+        ui.terminal.draw(ui.state)?;
+
+        let approved = loop {
+            let event = next_terminal_event(ui.terminal_events).await?;
+            if is_exit_event(&event) {
+                ui.state.clear_tool_approval();
+                store
+                    .fail_tool_call(record_id, "cancelled by user".to_owned())
+                    .await?;
+                return Ok(None);
+            }
+            match &event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) =>
+                {
+                    break true;
+                }
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N')) =>
+                {
+                    break false;
+                }
+                _ => {
+                    ui.state.handle_passive_event(&event);
+                    ui.terminal.draw(ui.state)?;
+                }
+            }
+        };
+        ui.state.clear_tool_approval();
+
+        if !approved {
+            store.deny_tool_call(record_id).await?;
+            ui.state
+                .push_tool_notice(format!("○ @{agent_name} {verb} {path} · denied"));
+            ui.terminal.draw(ui.state)?;
+            return Ok(Some(error_output(&"user denied file access")));
+        }
     }
 
     store.approve_tool_call(record_id).await?;
@@ -946,6 +1001,11 @@ async fn run_room(
                 }
             };
             let instructions = room_instructions(&room, participant);
+            let context = RoomCallContext {
+                store: &store,
+                room_call_id: call_id,
+                permissions: participant.permissions(),
+            };
             let outcome = tokio::select! {
                 result = render_room_response(
                     participant.agent_name(),
@@ -953,8 +1013,7 @@ async fn run_room(
                     &client,
                     &provider_messages,
                     &mut output,
-                    &store,
-                    call_id,
+                    &context,
                 ) => TurnOutcome::Response(result),
                 result = tokio::signal::ctrl_c() => TurnOutcome::Interrupted(result),
             };
@@ -1024,9 +1083,11 @@ async fn render_room_response(
     client: &OpenAiClient,
     messages: &[Message],
     output: &mut impl Write,
-    store: &Store,
-    room_call_id: i64,
+    context: &RoomCallContext<'_>,
 ) -> Result<AssistantResponse, AppError> {
+    let store = context.store;
+    let room_call_id = context.room_call_id;
+    let permissions = context.permissions;
     write!(output, "{agent_name}> ")?;
     output.flush()?;
     let mut input = ToolInput::from_messages(messages)?;
@@ -1039,7 +1100,12 @@ async fn render_room_response(
 
     loop {
         let events = client
-            .stream_with_tools(system_prompt, &input, tool_calls < MAX_TOOL_CALLS_PER_TURN)
+            .stream_with_tools(
+                system_prompt,
+                &input,
+                tool_calls < MAX_TOOL_CALLS_PER_TURN,
+                permissions,
+            )
             .await?;
         let round = match render_room_events(events, agent_name, output).await {
             Ok(round) => round,
@@ -1291,7 +1357,7 @@ mod tests {
         read_user_input, render_events, render_room_events, selected_command, write_agents,
         write_room_history, write_room_list, write_templates,
     };
-    use crate::config::Config;
+    use crate::config::{Config, Permission};
     use crate::openai::{ProviderError, decode_stream};
     use crate::room::RoomMessage;
     use crate::store::RoomSummary;
@@ -1430,6 +1496,10 @@ mod tests {
 
         let room = config.room("chat").unwrap();
         assert_eq!(room.agents(), ["assistant"]);
+        assert_eq!(
+            room.permissions().unwrap().get("assistant").unwrap(),
+            &[Permission::Read, Permission::Write]
+        );
     }
 
     #[test]

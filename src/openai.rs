@@ -1,4 +1,4 @@
-use crate::config::Agent;
+use crate::config::{Agent, Permission};
 use crate::message::Message;
 use crate::stream::{Completion, ResponseRound, StreamEvent, ToolCall};
 use eventsource_stream::{Event, Eventsource};
@@ -56,12 +56,13 @@ impl OpenAiClient {
         instructions: &str,
         input: &ToolInput,
         tools_enabled: bool,
+        permissions: Option<&[Permission]>,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        let tools = available_tools();
+        let tools = tools_for(permissions);
         let request = self.build_json_request(
             instructions,
             input.items(),
-            if tools_enabled { tools.as_slice() } else { &[] },
+            if tools_enabled { &tools } else { &[] },
             Some(&STATELESS_REASONING_INCLUDE),
         )?;
         self.execute_stream(request).await
@@ -180,6 +181,21 @@ struct FunctionTool {
     description: &'static str,
     parameters: Value,
     strict: bool,
+    #[serde(skip)]
+    category: Permission,
+}
+
+/// The tools offered to a participant, filtered by its granted permissions.
+/// `None` means unrestricted (today's behavior: every tool offered).
+fn tools_for(permissions: Option<&[Permission]>) -> Vec<FunctionTool> {
+    let tools = available_tools();
+    match permissions {
+        None => tools.into_iter().collect(),
+        Some(granted) => tools
+            .into_iter()
+            .filter(|tool| granted.contains(&tool.category))
+            .collect(),
+    }
 }
 
 fn available_tools() -> [FunctionTool; 4] {
@@ -187,6 +203,7 @@ fn available_tools() -> [FunctionTool; 4] {
         FunctionTool {
             kind: "function",
             name: "read_file",
+            category: Permission::Read,
             description: "Read a UTF-8 text file relative to the current workspace after the user approves access.",
             parameters: json!({
                 "type": "object",
@@ -204,6 +221,7 @@ fn available_tools() -> [FunctionTool; 4] {
         FunctionTool {
             kind: "function",
             name: "list_files",
+            category: Permission::Read,
             description: "List the immediate entries of a workspace-relative directory after the user approves access.",
             parameters: json!({
                 "type": "object",
@@ -221,6 +239,7 @@ fn available_tools() -> [FunctionTool; 4] {
         FunctionTool {
             kind: "function",
             name: "write_file",
+            category: Permission::Write,
             description: "Write UTF-8 text to a workspace-relative file after the user reviews a diff and approves. Creates the file if it doesn't exist; the parent directory must already exist.",
             parameters: json!({
                 "type": "object",
@@ -242,6 +261,7 @@ fn available_tools() -> [FunctionTool; 4] {
         FunctionTool {
             kind: "function",
             name: "search_files",
+            category: Permission::Read,
             description: "Search text files under a workspace-relative directory for a literal, case-sensitive substring, after the user approves access. Returns matching file paths, line numbers, and line content.",
             parameters: json!({
                 "type": "object",
@@ -532,8 +552,9 @@ mod tests {
     use super::{
         BoundedBodyBuffer, CreateResponseRequest, MAX_ERROR_BODY_BYTES, OpenAiClient,
         ProviderError, STATELESS_REASONING_INCLUDE, ToolInput, available_tools, decode_stream,
-        read_api_key,
+        read_api_key, tools_for,
     };
+    use crate::config::Permission;
     use crate::message::Message;
     use crate::stream::{Completion, ResponseRound, StreamEvent, ToolCall};
     use futures_util::{Stream, StreamExt, stream};
@@ -776,6 +797,23 @@ mod tests {
             json!(["query", "path"])
         );
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn tools_for_filters_by_granted_permission() {
+        let unrestricted = tools_for(None);
+        assert_eq!(unrestricted.len(), 4);
+
+        let read_only = tools_for(Some(&[Permission::Read]));
+        let names: Vec<_> = read_only.iter().map(|tool| tool.name).collect();
+        assert_eq!(names, ["read_file", "list_files", "search_files"]);
+
+        let none_granted = tools_for(Some(&[]));
+        assert!(none_granted.is_empty());
+
+        let write_only = tools_for(Some(&[Permission::Write]));
+        let names: Vec<_> = write_only.iter().map(|tool| tool.name).collect();
+        assert_eq!(names, ["write_file"]);
     }
 
     #[test]

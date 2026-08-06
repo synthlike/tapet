@@ -1,3 +1,4 @@
+use crate::config::Permission;
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use std::fs::{self, File};
@@ -85,6 +86,14 @@ impl ToolRequest {
             (Self::ListFiles(_), _) => "entries",
             (Self::SearchFiles(_), 1) => "match",
             (Self::SearchFiles(_), _) => "matches",
+        }
+    }
+
+    /// The permission category a room can grant to auto-approve this tool.
+    pub fn permission(&self) -> Permission {
+        match self {
+            Self::ReadFile(_) | Self::ListFiles(_) | Self::SearchFiles(_) => Permission::Read,
+            Self::WriteFile(_) => Permission::Write,
         }
     }
 
@@ -786,6 +795,7 @@ mod tests {
         DiffLineKind, ListFilesRequest, MAX_SEARCH_MATCHES, ReadFileRequest, SearchFilesRequest,
         ToolApprovalPreview, ToolError, ToolRequest, WriteFileRequest,
     };
+    use crate::config::Permission;
     use std::fs;
     use tempfile::TempDir;
 
@@ -935,6 +945,20 @@ mod tests {
             ToolRequest::parse("list_files", r#"{"path":"."}"#),
             Ok(ToolRequest::ListFiles(_))
         ));
+    }
+
+    #[test]
+    fn maps_each_tool_to_its_permission_category() {
+        let read_file = ToolRequest::parse("read_file", r#"{"path":"a"}"#).unwrap();
+        let list_files = ToolRequest::parse("list_files", r#"{"path":"."}"#).unwrap();
+        let search_files =
+            ToolRequest::parse("search_files", r#"{"query":"a","path":null}"#).unwrap();
+        let write_file = ToolRequest::parse("write_file", r#"{"path":"a","content":""}"#).unwrap();
+
+        assert_eq!(read_file.permission(), Permission::Read);
+        assert_eq!(list_files.permission(), Permission::Read);
+        assert_eq!(search_files.permission(), Permission::Read);
+        assert_eq!(write_file.permission(), Permission::Write);
     }
 
     #[test]

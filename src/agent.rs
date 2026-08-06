@@ -1,4 +1,4 @@
-use crate::config::{Agent, ProviderKind};
+use crate::config::{Agent, Permission, ProviderKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentSnapshot {
@@ -8,10 +8,14 @@ pub struct AgentSnapshot {
     api_key_env: String,
     model: String,
     system_prompt: String,
+    permissions: Option<Vec<Permission>>,
 }
 
 impl AgentSnapshot {
-    pub fn resolve(agent: &Agent) -> Self {
+    /// `permissions: None` means unrestricted — every tool is offered and
+    /// every call still prompts, today's behavior. `Some(categories)` means
+    /// only those categories are offered, and calls in them auto-approve.
+    pub fn resolve(agent: &Agent, permissions: Option<Vec<Permission>>) -> Self {
         Self {
             agent_name: agent.name().to_owned(),
             provider_kind: agent.provider_kind(),
@@ -19,6 +23,7 @@ impl AgentSnapshot {
             api_key_env: agent.api_key_env().to_owned(),
             model: agent.model().to_owned(),
             system_prompt: agent.prompt().to_owned(),
+            permissions,
         }
     }
 
@@ -46,6 +51,10 @@ impl AgentSnapshot {
         &self.system_prompt
     }
 
+    pub fn permissions(&self) -> Option<&[Permission]> {
+        self.permissions.as_deref()
+    }
+
     pub(crate) fn from_stored(
         agent_name: String,
         provider_kind: ProviderKind,
@@ -53,6 +62,7 @@ impl AgentSnapshot {
         api_key_env: String,
         model: String,
         system_prompt: String,
+        permissions: Option<Vec<Permission>>,
     ) -> Self {
         Self {
             agent_name,
@@ -61,6 +71,7 @@ impl AgentSnapshot {
             api_key_env,
             model,
             system_prompt,
+            permissions,
         }
     }
 }
@@ -79,6 +90,14 @@ impl AgentSnapshot {
             api_key_env: "TEST_OPENAI_API_KEY".to_owned(),
             model: model.to_owned(),
             system_prompt: prompt.to_owned(),
+            permissions: None,
+        }
+    }
+
+    pub fn fixture_with_permissions(agent_name: &str, permissions: Vec<Permission>) -> Self {
+        Self {
+            permissions: Some(permissions),
+            ..Self::fixture_for(agent_name, "test-model", "Test")
         }
     }
 }

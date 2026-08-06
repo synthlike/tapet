@@ -22,6 +22,7 @@ pub struct RoomTemplate {
     agents: Vec<String>,
     description: String,
     prompt: String,
+    permissions: Option<BTreeMap<String, Vec<Permission>>>,
 }
 
 impl RoomTemplate {
@@ -39,6 +40,49 @@ impl RoomTemplate {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    /// `None` means the room defines no `[rooms.*.permissions]` table at
+    /// all (legacy behavior: every tool offered to every participant,
+    /// every call still prompts). `Some(table)` means the room is opted
+    /// into per-agent grants; an agent missing from the table gets no
+    /// tools at all.
+    pub fn permissions(&self) -> Option<&BTreeMap<String, Vec<Permission>>> {
+        self.permissions.as_ref()
+    }
+}
+
+/// A tool category an agent can be granted, per room. `Call` and `Exec`
+/// are accepted now even though no tool maps to them yet (`call_agent`
+/// and a future shell tool, respectively) so rooms don't need editing
+/// again once those ship.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    Read,
+    Write,
+    Call,
+    Exec,
+}
+
+impl Permission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Call => "call",
+            Self::Exec => "exec",
+        }
+    }
+
+    pub(crate) fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "call" => Some(Self::Call),
+            "exec" => Some(Self::Exec),
+            _ => None,
+        }
     }
 }
 
@@ -151,6 +195,7 @@ struct RawRoom {
     default: String,
     description: String,
     prompt: String,
+    permissions: Option<BTreeMap<String, Vec<Permission>>>,
 }
 
 #[derive(Debug)]
@@ -201,6 +246,10 @@ pub enum ConfigError {
         available: Vec<String>,
     },
     UnknownRoomAgent {
+        room: String,
+        agent: String,
+    },
+    UnknownRoomPermissionAgent {
         room: String,
         agent: String,
     },
@@ -314,6 +363,16 @@ impl Config {
                     reason: "`default` must name an agent in the room",
                 });
             }
+            if let Some(permissions) = &raw_room.permissions {
+                for agent in permissions.keys() {
+                    if !unique.contains(agent) {
+                        return Err(ConfigError::UnknownRoomPermissionAgent {
+                            room: name.clone(),
+                            agent: agent.clone(),
+                        });
+                    }
+                }
+            }
 
             let mut ordered_agents = vec![raw_room.default.clone()];
             ordered_agents.extend(
@@ -329,6 +388,7 @@ impl Config {
                     agents: ordered_agents,
                     description: raw_room.description,
                     prompt: raw_room.prompt,
+                    permissions: raw_room.permissions,
                 },
             );
         }
@@ -541,6 +601,10 @@ impl fmt::Display for ConfigError {
                     "room `{room}` references unknown agent `{agent}`"
                 )
             }
+            Self::UnknownRoomPermissionAgent { room, agent } => write!(
+                formatter,
+                "room `{room}` grants permissions to `{agent}`, which is not in its `agents` list"
+            ),
             Self::UnknownRoom { name, available } => write!(
                 formatter,
                 "unknown room template `{name}`; available templates: {}",
@@ -562,7 +626,7 @@ impl Error for ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, DEFAULT_OPENAI_BASE_URL, ProviderKind};
+    use super::{Config, ConfigError, DEFAULT_OPENAI_BASE_URL, Permission, ProviderKind};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -697,6 +761,67 @@ mod tests {
         assert_eq!(room.agents(), ["explorer", "reviewer"]);
         assert_eq!(room.description(), "Research room");
         assert_eq!(room.prompt(), "Cite evidence");
+        assert!(room.permissions().is_none());
+    }
+
+    #[test]
+    fn resolves_room_permissions_and_validates_their_agents() {
+        let directory = TestDirectory::new();
+        let path = directory.write(
+            "tapet.toml",
+            &configuration(concat!(
+                "[agents.architect]\nmodel = \"primary\"\nprompt = \"Plan\"\n",
+                "[agents.dev]\nmodel = \"primary\"\nprompt = \"Build\"\n",
+                "[rooms.build]\nagents = [\"architect\", \"dev\"]\n",
+                "default = \"architect\"\n",
+                "description = \"Ship it\"\nprompt = \"Build the thing\"\n",
+                "[rooms.build.permissions]\n",
+                "architect = [\"read\"]\n",
+                "dev = [\"read\", \"write\"]\n",
+            )),
+        );
+
+        let config = Config::load(path).unwrap();
+        let permissions = config.room("build").unwrap().permissions().unwrap();
+
+        assert_eq!(permissions.get("architect").unwrap(), &[Permission::Read]);
+        assert_eq!(
+            permissions.get("dev").unwrap(),
+            &[Permission::Read, Permission::Write]
+        );
+
+        let unknown_permission_agent = directory.write(
+            "unknown-permission-agent.toml",
+            &configuration(concat!(
+                "[agents.architect]\nmodel = \"primary\"\nprompt = \"Plan\"\n",
+                "[rooms.build]\nagents = [\"architect\"]\n",
+                "default = \"architect\"\n",
+                "description = \"Ship it\"\nprompt = \"Build the thing\"\n",
+                "[rooms.build.permissions]\n",
+                "tester = [\"exec\"]\n",
+            )),
+        );
+        assert!(matches!(
+            Config::load(unknown_permission_agent),
+            Err(ConfigError::UnknownRoomPermissionAgent { room, agent })
+                if room == "build" && agent == "tester"
+        ));
+
+        let invalid_category = directory.write(
+            "invalid-permission-category.toml",
+            &configuration(concat!(
+                "[agents.architect]\nmodel = \"primary\"\nprompt = \"Plan\"\n",
+                "[rooms.build]\nagents = [\"architect\"]\n",
+                "default = \"architect\"\n",
+                "description = \"Ship it\"\nprompt = \"Build the thing\"\n",
+                "[rooms.build.permissions]\n",
+                "architect = [\"delete\"]\n",
+            )),
+        );
+        assert!(matches!(
+            Config::load(invalid_category),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]
