@@ -224,6 +224,33 @@ impl Store {
         ))
     }
 
+    /// Rooms already persisted in the local database — the ones `tapet enter`
+    /// can resume — most recently active first.
+    pub async fn list_rooms(&self) -> Result<Vec<RoomSummary>, StoreError> {
+        Ok(self
+            .connection
+            .call(|connection| {
+                let mut statement =
+                    connection.prepare("SELECT id, name FROM rooms ORDER BY updated_at DESC")?;
+                let rooms = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                let mut summaries = Vec::with_capacity(rooms.len());
+                for (id, name) in rooms {
+                    let participants = query_room_participant_names(connection, &id)?;
+                    summaries.push(RoomSummary {
+                        name: name.parse().expect("stored room name is valid"),
+                        participants,
+                    });
+                }
+                Ok(summaries)
+            })
+            .await?)
+    }
+
     pub async fn add_room_participant(
         &self,
         room_id: &RoomId,
@@ -568,6 +595,41 @@ pub(crate) struct AppendedRoomMessage {
     pub messages: Vec<RoomMessage>,
 }
 
+pub struct RoomSummary {
+    name: RoomName,
+    participants: Vec<String>,
+}
+
+impl RoomSummary {
+    pub fn name(&self) -> &RoomName {
+        &self.name
+    }
+
+    pub fn participants(&self) -> &[String] {
+        &self.participants
+    }
+}
+
+#[cfg(test)]
+impl RoomSummary {
+    pub fn fixture(name: &str, participants: &[&str]) -> Self {
+        Self {
+            name: name.parse().expect("fixture room name is valid"),
+            participants: participants.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+}
+
+fn query_room_participant_names(
+    connection: &rusqlite::Connection,
+    room_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT agent_name FROM room_participants WHERE room_id = ?1 ORDER BY position ASC",
+    )?;
+    statement.query_map([room_id], |row| row.get(0))?.collect()
+}
+
 fn query_room_participants(
     connection: &rusqlite::Connection,
     room_id: &str,
@@ -794,6 +856,47 @@ mod tests {
             store.add_room_participant(room.id(), doubter).await,
             Err(StoreError::ParticipantAlreadyExists(name)) if name == "doubter"
         ));
+    }
+
+    #[tokio::test]
+    async fn lists_rooms_most_recently_updated_first() {
+        let temporary = TempDir::new().unwrap();
+        let store = Store::open(temporary.path().join("tapet.db"))
+            .await
+            .unwrap();
+        let explorer = AgentSnapshot::fixture_for("explorer", "fast-model", "Explore");
+        let duck = AgentSnapshot::fixture_for("duck", "fast-model", "Ask");
+
+        let first = store
+            .create_room(
+                Some("first-room".parse().unwrap()),
+                vec![explorer],
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store
+            .create_room(
+                Some("second-room".parse().unwrap()),
+                vec![duck.clone()],
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+
+        let rooms = store.list_rooms().await.unwrap();
+        let names: Vec<_> = rooms.iter().map(|room| room.name().to_string()).collect();
+        assert_eq!(names, ["second-room", "first-room"]);
+        assert_eq!(rooms[0].participants(), ["duck".to_owned()]);
+        assert_eq!(rooms[1].participants(), ["explorer".to_owned()]);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.add_room_participant(first.id(), duck).await.unwrap();
+        let rooms = store.list_rooms().await.unwrap();
+        assert_eq!(rooms[0].name().to_string(), "first-room");
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ mod tool;
 mod ui;
 
 use agent::AgentSnapshot;
-use config::{Agent, Config, ConfigError};
+use config::{Agent, Config, ConfigError, RoomTemplate};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use message::Message;
@@ -24,7 +24,7 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process;
-use store::{Store, StoreError};
+use store::{RoomSummary, Store, StoreError};
 use stream::{Completion, ResponseRound, StreamEvent, ToolCall};
 use terminal::InputSuppression;
 use thiserror::Error;
@@ -38,6 +38,8 @@ const DATABASE_PATH: &str = ".tapet/tapet.db";
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Agents,
+    Templates,
+    Rooms,
     Ask {
         agent: String,
         message: String,
@@ -73,6 +75,18 @@ fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command,
                 return Err(AppError::Usage);
             }
             Ok(Command::Agents)
+        }
+        "templates" => {
+            if args.next().is_some() {
+                return Err(AppError::Usage);
+            }
+            Ok(Command::Templates)
+        }
+        "rooms" => {
+            if args.next().is_some() {
+                return Err(AppError::Usage);
+            }
+            Ok(Command::Rooms)
         }
         "ask" => {
             let agent = next_argument(&mut args)?;
@@ -150,6 +164,17 @@ async fn try_main() -> Result<(), AppError> {
             let config = Config::load(Path::new(CONFIG_PATH))?;
             let stdout = io::stdout();
             write_agents(config.agents(), &mut stdout.lock())?;
+        }
+        Command::Templates => {
+            let config = Config::load(Path::new(CONFIG_PATH))?;
+            let stdout = io::stdout();
+            write_templates(config.rooms(), &mut stdout.lock())?;
+        }
+        Command::Rooms => {
+            let store = Store::open(DATABASE_PATH).await?;
+            let rooms = store.list_rooms().await?;
+            let stdout = io::stdout();
+            write_room_list(&rooms, &mut stdout.lock())?;
         }
         Command::Ask {
             agent: agent_name,
@@ -242,15 +267,57 @@ fn write_agents<'a>(
     agents: impl Iterator<Item = &'a Agent>,
     output: &mut impl Write,
 ) -> io::Result<()> {
-    for agent in agents {
+    let rows: Vec<_> = agents
+        .map(|agent| (agent.name(), agent.provider_name(), agent.model()))
+        .collect();
+    let name_width = rows.iter().map(|(name, ..)| name.len()).max().unwrap_or(0);
+    let provider_width = rows
+        .iter()
+        .map(|(_, provider, _)| provider.len())
+        .max()
+        .unwrap_or(0);
+    for (name, provider, model) in rows {
         writeln!(
             output,
-            "{}\t{}\t{}\t{}",
-            agent.name(),
-            agent.model_alias(),
-            agent.provider_name(),
-            agent.model()
+            "{name:name_width$}  {provider:provider_width$}  {model}"
         )?;
+    }
+    Ok(())
+}
+
+fn write_templates<'a>(
+    rooms: impl Iterator<Item = &'a RoomTemplate>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    let rows: Vec<_> = rooms
+        .map(|room| {
+            let default = room.agents().first().map_or("", String::as_str);
+            (room.name(), default, room.agents().join(", "))
+        })
+        .collect();
+    let name_width = rows.iter().map(|(name, ..)| name.len()).max().unwrap_or(0);
+    let default_width = rows
+        .iter()
+        .map(|(_, default, _)| default.len())
+        .max()
+        .unwrap_or(0);
+    for (name, default, agents) in rows {
+        writeln!(
+            output,
+            "{name:name_width$}  {default:default_width$}  {agents}"
+        )?;
+    }
+    Ok(())
+}
+
+fn write_room_list(rooms: &[RoomSummary], output: &mut impl Write) -> io::Result<()> {
+    let rows: Vec<_> = rooms
+        .iter()
+        .map(|room| (room.name().to_string(), room.participants().join(", ")))
+        .collect();
+    let name_width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    for (name, agents) in rows {
+        writeln!(output, "{name:name_width$}  {agents}")?;
     }
     Ok(())
 }
@@ -1128,7 +1195,7 @@ async fn main() {
 #[derive(Debug, Error)]
 enum AppError {
     #[error(
-        "usage: tapet agents\n       tapet ask <agent> <message>\n       tapet room [--name <name>] --with <agent> [--with <agent>...]\n       tapet room [--name <name>] --from <template>\n       tapet enter <room>\n       tapet history <room>"
+        "usage: tapet agents\n       tapet templates\n       tapet rooms\n       tapet ask <agent> <message>\n       tapet room [--name <name>] --with <agent> [--with <agent>...]\n       tapet room [--name <name>] --from <template>\n       tapet enter <room>\n       tapet history <room>"
     )]
     Usage,
     #[error(transparent)]
@@ -1155,11 +1222,12 @@ enum AppError {
 mod tests {
     use super::{
         Command, RoomSource, UserInput, read_user_input, render_events, render_room_events,
-        selected_command, write_agents, write_room_history,
+        selected_command, write_agents, write_room_history, write_room_list, write_templates,
     };
     use crate::config::Config;
     use crate::openai::{ProviderError, decode_stream};
     use crate::room::RoomMessage;
+    use crate::store::RoomSummary;
     use crate::stream::{Completion, ResponseRound, StreamEvent, ToolCall};
     use futures_util::stream;
     use std::ffi::OsString;
@@ -1173,6 +1241,26 @@ mod tests {
         assert_eq!(
             selected_command([OsString::from("agents")].into_iter()).unwrap(),
             Command::Agents
+        );
+    }
+
+    #[test]
+    fn parses_template_and_room_listing_commands() {
+        assert_eq!(
+            selected_command([OsString::from("templates")].into_iter()).unwrap(),
+            Command::Templates
+        );
+        assert!(
+            selected_command([OsString::from("templates"), OsString::from("extra")].into_iter())
+                .is_err()
+        );
+        assert_eq!(
+            selected_command([OsString::from("rooms")].into_iter()).unwrap(),
+            Command::Rooms
+        );
+        assert!(
+            selected_command([OsString::from("rooms"), OsString::from("extra")].into_iter())
+                .is_err()
         );
     }
 
@@ -1396,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_listing_has_stable_tab_separated_output() {
+    fn agent_listing_is_column_aligned_by_name_and_provider() {
         let temporary = TempDir::new().unwrap();
         let path = temporary.path().join("tapet.toml");
         fs::write(
@@ -1405,7 +1493,7 @@ mod tests {
                 "version = 1\n",
                 "[providers.openai]\ntype = \"openai\"\napi_key_env = \"KEY\"\n",
                 "[models.primary]\nprovider = \"openai\"\nmodel = \"gpt-test\"\n",
-                "[agents.reviewer]\nmodel = \"primary\"\nprompt = \"Review\"\n",
+                "[agents.ex]\nmodel = \"primary\"\nprompt = \"Explore\"\n",
                 "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n"
             ),
         )
@@ -1415,13 +1503,57 @@ mod tests {
 
         write_agents(config.agents(), &mut output).unwrap();
 
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            concat!(
-                "explorer\tprimary\topenai\tgpt-test\n",
-                "reviewer\tprimary\topenai\tgpt-test\n"
-            )
+        let expected = format!(
+            "{:<8}  {:<6}  {}\n{:<8}  {:<6}  {}\n",
+            "ex", "openai", "gpt-test", "explorer", "openai", "gpt-test"
         );
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+
+    #[test]
+    fn template_listing_is_column_aligned_with_default_agent_first() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("tapet.toml");
+        fs::write(
+            &path,
+            concat!(
+                "version = 1\n",
+                "[providers.openai]\ntype = \"openai\"\napi_key_env = \"KEY\"\n",
+                "[models.primary]\nprovider = \"openai\"\nmodel = \"gpt-test\"\n",
+                "[agents.explorer]\nmodel = \"primary\"\nprompt = \"Explore\"\n",
+                "[agents.doubter]\nmodel = \"primary\"\nprompt = \"Doubt\"\n",
+                "[rooms.research]\nagents = [\"explorer\", \"doubter\"]\n",
+                "default = \"explorer\"\ndescription = \"Research\"\nprompt = \"Cite evidence\"\n"
+            ),
+        )
+        .unwrap();
+        let config = Config::load(path).unwrap();
+        let mut output = Vec::new();
+
+        write_templates(config.rooms(), &mut output).unwrap();
+
+        let expected = format!(
+            "{:<8}  {:<8}  {}\n",
+            "research", "explorer", "explorer, doubter"
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+
+    #[test]
+    fn room_listing_is_column_aligned() {
+        let rooms = [
+            RoomSummary::fixture("sweaty-warroom", &["explorer", "doubter"]),
+            RoomSummary::fixture("haunted-basement", &["duck"]),
+        ];
+        let mut output = Vec::new();
+
+        write_room_list(&rooms, &mut output).unwrap();
+
+        let expected = format!(
+            "{:<16}  {}\n{:<16}  {}\n",
+            "sweaty-warroom", "explorer, doubter", "haunted-basement", "duck"
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
     }
 
     #[tokio::test]

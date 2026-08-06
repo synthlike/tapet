@@ -18,12 +18,17 @@ pub struct Config {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct RoomTemplate {
+    name: String,
     agents: Vec<String>,
     description: String,
     prompt: String,
 }
 
 impl RoomTemplate {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn agents(&self) -> &[String] {
         &self.agents
     }
@@ -61,7 +66,6 @@ impl ProviderKind {
 #[derive(Debug)]
 pub struct Agent {
     name: String,
-    model_alias: String,
     provider_name: String,
     provider_kind: ProviderKind,
     base_url: String,
@@ -73,10 +77,6 @@ pub struct Agent {
 impl Agent {
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    pub fn model_alias(&self) -> &str {
-        &self.model_alias
     }
 
     pub fn provider_name(&self) -> &str {
@@ -258,7 +258,6 @@ impl Config {
                 name.clone(),
                 Agent {
                     name,
-                    model_alias,
                     provider_name: model.provider.clone(),
                     provider_kind: provider.kind,
                     base_url: provider.base_url.clone(),
@@ -271,6 +270,7 @@ impl Config {
 
         let mut rooms = BTreeMap::new();
         for (name, raw_room) in raw.rooms {
+            let room_name = name.clone();
             validate_name("room", &name).map_err(|reason| ConfigError::InvalidRoom {
                 name: name.clone(),
                 reason,
@@ -325,6 +325,7 @@ impl Config {
             rooms.insert(
                 name,
                 RoomTemplate {
+                    name: room_name,
                     agents: ordered_agents,
                     description: raw_room.description,
                     prompt: raw_room.prompt,
@@ -346,6 +347,10 @@ impl Config {
 
     pub fn agents(&self) -> impl Iterator<Item = &Agent> {
         self.agents.values()
+    }
+
+    pub fn rooms(&self) -> impl Iterator<Item = &RoomTemplate> {
+        self.rooms.values()
     }
 
     pub fn room(&self, name: &str) -> Result<&RoomTemplate, ConfigError> {
@@ -628,7 +633,6 @@ mod tests {
         assert_eq!(agent.provider_name(), "openai");
         assert_eq!(agent.base_url(), DEFAULT_OPENAI_BASE_URL);
         assert_eq!(agent.api_key_env(), "OPENAI_API_KEY");
-        assert_eq!(agent.model_alias(), "primary");
         assert_eq!(agent.model(), "test-model");
         assert_eq!(agent.prompt(), "Explore carefully");
     }

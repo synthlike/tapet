@@ -21,6 +21,10 @@ Configure providers, model aliases, and agents in `tapet.toml`, then export the
 API-key environment variable named by the provider.
 
 ```sh
+tapet agents                                    # list configured agents
+tapet templates                                 # list tapet.toml room templates
+tapet rooms                                     # list rooms you can enter, most recent first
+
 tapet ask explorer "What's out there?"          # one-shot question
 
 tapet room --with explorer --with doubter       # ad-hoc room
