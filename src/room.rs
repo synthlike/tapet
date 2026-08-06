@@ -197,6 +197,9 @@ pub fn room_instructions(room: &Room, agent: &AgentSnapshot) -> String {
         instructions.push_str("\n\nRoom instructions:\n");
         instructions.push_str(room.prompt());
     }
+    instructions.push_str(
+        "\n\nTapet may expose proposal-only tools. You may request one when it is needed, but this version will display the request without executing it. Never claim that a proposed tool ran or that you observed its result.",
+    );
     instructions
 }
 

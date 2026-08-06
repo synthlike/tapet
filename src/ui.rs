@@ -11,6 +11,12 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::io;
 
+const COMMANDS: [(&str, &str); 3] = [
+    ("/agents", "Show room participants"),
+    ("/exit", "Leave the room"),
+    ("/help", "Show room commands"),
+];
+
 pub struct TerminalUi {
     terminal: DefaultTerminal,
 }
@@ -59,6 +65,9 @@ pub struct RoomUi {
     messages: Vec<RoomMessage>,
     input: String,
     cursor: usize,
+    input_history: Vec<String>,
+    history_position: Option<usize>,
+    history_draft: String,
     completion: Option<CompletionMenu>,
     live_response: Option<LiveResponse>,
     status: String,
@@ -77,12 +86,23 @@ struct LiveResponse {
 struct CompletionMenu {
     start: usize,
     end: usize,
-    candidates: Vec<String>,
+    title: &'static str,
+    candidates: Vec<CompletionCandidate>,
     selected: usize,
+}
+
+struct CompletionCandidate {
+    value: String,
+    description: &'static str,
 }
 
 impl RoomUi {
     pub fn new(room: &Room, messages: Vec<RoomMessage>) -> Self {
+        let input_history = messages
+            .iter()
+            .filter(|message| matches!(message.speaker(), RoomSpeaker::User))
+            .map(|message| message.content().to_owned())
+            .collect();
         Self {
             room_id: room.id().to_string(),
             description: room.description().to_owned(),
@@ -94,6 +114,9 @@ impl RoomUi {
             messages,
             input: String::new(),
             cursor: 0,
+            input_history,
+            history_position: None,
+            history_draft: String::new(),
             completion: None,
             live_response: None,
             status: "Ready".to_owned(),
@@ -111,6 +134,7 @@ impl RoomUi {
                 self.handle_key(key)
             }
             Event::Paste(text) => {
+                self.leave_history_navigation();
                 self.insert(&text.replace(['\r', '\n'], " "));
                 InputAction::None
             }
@@ -129,6 +153,9 @@ impl RoomUi {
     }
 
     pub fn push_message(&mut self, message: RoomMessage) {
+        if matches!(message.speaker(), RoomSpeaker::User) {
+            self.record_input(message.content());
+        }
         self.messages.push(message);
         self.follow_output = true;
     }
@@ -187,6 +214,7 @@ impl RoomUi {
                     InputAction::None
                 }
                 KeyCode::Char('u') => {
+                    self.leave_history_navigation();
                     self.input.drain(..self.cursor);
                     self.cursor = 0;
                     InputAction::None
@@ -197,18 +225,29 @@ impl RoomUi {
         }
 
         match key.code {
-            KeyCode::Char(character) => self.insert(&character.to_string()),
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
+            KeyCode::Char(character) => {
+                self.leave_history_navigation();
+                self.insert(&character.to_string());
+            }
+            KeyCode::Backspace => {
+                self.leave_history_navigation();
+                self.backspace();
+            }
+            KeyCode::Delete => {
+                self.leave_history_navigation();
+                self.delete();
+            }
             KeyCode::Left => self.move_left(),
             KeyCode::Right => self.move_right(),
+            KeyCode::Up => self.previous_input(),
+            KeyCode::Down => self.next_input(),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Esc => {
                 self.input.clear();
                 self.cursor = 0;
             }
-            KeyCode::Tab => self.complete_agent(),
+            KeyCode::Tab => self.complete_token(),
             KeyCode::PageUp => {
                 self.scroll_up(self.viewport_height.saturating_sub(1).max(1));
             }
@@ -219,9 +258,32 @@ impl RoomUi {
                 let message = self.input.trim().to_owned();
                 self.input.clear();
                 self.cursor = 0;
+                self.history_position = None;
+                self.history_draft.clear();
                 return match message.as_str() {
                     "" => InputAction::None,
                     "/exit" => InputAction::Exit,
+                    "/help" => {
+                        self.set_status("Commands: /agents · /help · /exit");
+                        InputAction::None
+                    }
+                    "/agents" => {
+                        self.set_status(format!(
+                            "Participants: {}",
+                            self.participants
+                                .iter()
+                                .map(|name| format!("@{name}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                        InputAction::None
+                    }
+                    command if command.starts_with('/') => {
+                        self.set_error(format!(
+                            "Unknown command `{command}`; use /help for available commands"
+                        ));
+                        InputAction::None
+                    }
                     _ => InputAction::Submit(message),
                 };
             }
@@ -248,25 +310,58 @@ impl RoomUi {
         true
     }
 
-    fn complete_agent(&mut self) {
-        let Some((start, prefix)) = self.agent_prefix_at_cursor() else {
-            return;
-        };
-        let prefix = prefix.to_ascii_lowercase();
-        let candidates = self
-            .participants
-            .iter()
-            .filter(|name| name.to_ascii_lowercase().starts_with(&prefix))
-            .cloned()
-            .collect::<Vec<_>>();
+    fn complete_token(&mut self) {
+        if let Some((start, prefix)) = self.agent_prefix_at_cursor() {
+            let lowercase = prefix.to_ascii_lowercase();
+            let candidates = self
+                .participants
+                .iter()
+                .filter(|name| name.to_ascii_lowercase().starts_with(&lowercase))
+                .map(|name| CompletionCandidate {
+                    value: format!("@{name}"),
+                    description: "",
+                })
+                .collect::<Vec<_>>();
+            self.open_completion(
+                start,
+                " Complete @agent ",
+                candidates,
+                format!("No room participant matches `@{lowercase}`"),
+            );
+        } else if let Some(prefix) = self.command_prefix_at_cursor() {
+            let lowercase = prefix.to_ascii_lowercase();
+            let candidates = COMMANDS
+                .iter()
+                .filter(|(command, _)| command.starts_with(&lowercase))
+                .map(|(command, description)| CompletionCandidate {
+                    value: (*command).to_owned(),
+                    description,
+                })
+                .collect::<Vec<_>>();
+            self.open_completion(
+                0,
+                " Complete /command ",
+                candidates,
+                format!("No command matches `{lowercase}`"),
+            );
+        }
+    }
 
+    fn open_completion(
+        &mut self,
+        start: usize,
+        title: &'static str,
+        candidates: Vec<CompletionCandidate>,
+        no_match: String,
+    ) {
         match candidates.len() {
-            0 => self.set_error(format!("No room participant matches `@{prefix}`")),
-            1 => self.insert_completion(start, self.cursor, &candidates[0]),
+            0 => self.set_error(no_match),
+            1 => self.insert_completion(start, self.cursor, &candidates[0].value),
             _ => {
                 self.completion = Some(CompletionMenu {
                     start,
                     end: self.cursor,
+                    title,
                     candidates,
                     selected: 0,
                 });
@@ -292,6 +387,12 @@ impl RoomUi {
         }
     }
 
+    fn command_prefix_at_cursor(&self) -> Option<&str> {
+        let before_cursor = &self.input[..self.cursor];
+        (before_cursor.starts_with('/') && !before_cursor.chars().any(char::is_whitespace))
+            .then_some(before_cursor)
+    }
+
     fn select_next_completion(&mut self) {
         if let Some(completion) = &mut self.completion {
             completion.selected = (completion.selected + 1) % completion.candidates.len();
@@ -311,14 +412,14 @@ impl RoomUi {
         let Some(completion) = self.completion.take() else {
             return;
         };
-        let candidate = completion.candidates[completion.selected].clone();
+        let candidate = completion.candidates[completion.selected].value.clone();
         self.insert_completion(completion.start, completion.end, &candidate);
     }
 
     fn insert_completion(&mut self, start: usize, end: usize, candidate: &str) {
-        let replacement = format!("@{candidate}");
-        self.input.replace_range(start..end, &replacement);
-        self.cursor = start + replacement.len();
+        self.leave_history_navigation();
+        self.input.replace_range(start..end, candidate);
+        self.cursor = start + candidate.len();
         if self.cursor == self.input.len() {
             self.input.push(' ');
             self.cursor += 1;
@@ -358,6 +459,51 @@ impl RoomUi {
         if let Some(character) = self.input[self.cursor..].chars().next() {
             self.cursor += character.len_utf8();
         }
+    }
+
+    fn previous_input(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let position = match self.history_position {
+            Some(position) => position.saturating_sub(1),
+            None => {
+                self.history_draft = self.input.clone();
+                self.input_history.len() - 1
+            }
+        };
+        self.history_position = Some(position);
+        self.input.clone_from(&self.input_history[position]);
+        self.cursor = self.input.len();
+    }
+
+    fn next_input(&mut self) {
+        let Some(position) = self.history_position else {
+            return;
+        };
+        if position + 1 < self.input_history.len() {
+            let next = position + 1;
+            self.history_position = Some(next);
+            self.input.clone_from(&self.input_history[next]);
+        } else {
+            self.history_position = None;
+            self.input.clone_from(&self.history_draft);
+            self.history_draft.clear();
+        }
+        self.cursor = self.input.len();
+    }
+
+    fn leave_history_navigation(&mut self) {
+        self.history_position = None;
+        self.history_draft.clear();
+    }
+
+    fn record_input(&mut self, input: &str) {
+        if !input.is_empty() && self.input_history.last().is_none_or(|last| last != input) {
+            self.input_history.push(input.to_owned());
+        }
+        self.history_position = None;
+        self.history_draft.clear();
     }
 
     fn scroll_up(&mut self, lines: u16) {
@@ -423,10 +569,19 @@ fn render_completion(frame: &mut Frame<'_>, state: &RoomUi, area: Rect) {
         .enumerate()
         .skip(start)
         .take(visible_count)
-        .map(|(index, name)| {
+        .map(|(index, candidate)| {
             let selected = index == completion.selected;
             Line::styled(
-                format!("{} @{name}", if selected { "›" } else { " " }),
+                format!(
+                    "{} {}{}",
+                    if selected { "›" } else { " " },
+                    candidate.value,
+                    if candidate.description.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {}", candidate.description)
+                    }
+                ),
                 if selected {
                     Style::default()
                         .fg(Color::Black)
@@ -442,7 +597,7 @@ fn render_completion(frame: &mut Frame<'_>, state: &RoomUi, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Complete @agent "),
+                .title(completion.title),
         ),
         area,
     );
@@ -718,6 +873,51 @@ mod tests {
 
         assert_eq!(state.input, "@expert ");
         assert!(state.completion.is_none());
+    }
+
+    #[test]
+    fn input_history_uses_persisted_user_messages_and_restores_the_draft() {
+        let mut state = RoomUi::new(
+            &room(),
+            vec![
+                RoomMessage::user("first question"),
+                RoomMessage::agent("explorer", "answer"),
+                RoomMessage::user("second question"),
+            ],
+        );
+        for character in "unfinished".chars() {
+            state.handle_event(key(KeyCode::Char(character)));
+        }
+
+        state.handle_event(key(KeyCode::Up));
+        assert_eq!(state.input, "second question");
+        state.handle_event(key(KeyCode::Up));
+        assert_eq!(state.input, "first question");
+        state.handle_event(key(KeyCode::Down));
+        assert_eq!(state.input, "second question");
+        state.handle_event(key(KeyCode::Down));
+        assert_eq!(state.input, "unfinished");
+    }
+
+    #[test]
+    fn slash_commands_complete_and_run_locally() {
+        let mut state = RoomUi::new(&room(), Vec::new());
+        for character in "/a".chars() {
+            state.handle_event(key(KeyCode::Char(character)));
+        }
+        state.handle_event(key(KeyCode::Tab));
+        assert_eq!(state.input, "/agents ");
+
+        assert_eq!(state.handle_event(key(KeyCode::Enter)), InputAction::None);
+        assert_eq!(state.status, "Participants: @explorer, @doubter");
+
+        state.handle_event(key(KeyCode::Char('/')));
+        state.handle_event(key(KeyCode::Tab));
+        assert_eq!(state.completion.as_ref().unwrap().candidates.len(), 3);
+        assert_eq!(
+            state.completion.as_ref().unwrap().title,
+            " Complete /command "
+        );
     }
 
     fn mouse(kind: MouseEventKind) -> Event {

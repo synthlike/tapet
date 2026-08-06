@@ -1,9 +1,10 @@
 use crate::config::Agent;
 use crate::message::Message;
-use crate::stream::{Completion, StreamEvent};
+use crate::stream::{Completion, StreamEvent, ToolCall};
 use eventsource_stream::{Event, Eventsource};
 use futures_util::stream::{BoxStream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::env;
 use std::fmt;
 use thiserror::Error;
@@ -46,6 +47,23 @@ impl OpenAiClient {
         messages: &[Message],
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         let request = self.build_request(instructions, messages)?;
+        self.execute_stream(request).await
+    }
+
+    pub async fn stream_with_tool_proposals(
+        &self,
+        instructions: &str,
+        messages: &[Message],
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        let tools = proposal_tools();
+        let request = self.build_request_with_tools(instructions, messages, &tools)?;
+        self.execute_stream(request).await
+    }
+
+    async fn execute_stream(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         let response = self.http.execute(request).await?;
 
         let status = response.status();
@@ -65,12 +83,22 @@ impl OpenAiClient {
         instructions: &str,
         messages: &[Message],
     ) -> Result<reqwest::Request, ProviderError> {
+        self.build_request_with_tools(instructions, messages, &[])
+    }
+
+    fn build_request_with_tools(
+        &self,
+        instructions: &str,
+        messages: &[Message],
+        tools: &[FunctionTool],
+    ) -> Result<reqwest::Request, ProviderError> {
         let request = CreateResponseRequest {
             model: &self.model,
             instructions,
             input: messages,
             store: false,
             stream: true,
+            tools,
         };
 
         Ok(self
@@ -98,6 +126,38 @@ struct CreateResponseRequest<'a> {
     input: &'a [Message],
     store: bool,
     stream: bool,
+    #[serde(skip_serializing_if = "<[FunctionTool]>::is_empty")]
+    tools: &'a [FunctionTool],
+}
+
+#[derive(Debug, Serialize)]
+struct FunctionTool {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    name: &'static str,
+    description: &'static str,
+    parameters: Value,
+    strict: bool,
+}
+
+fn proposal_tools() -> [FunctionTool; 1] {
+    [FunctionTool {
+        kind: "function",
+        name: "read_file",
+        description: "Propose reading a UTF-8 text file relative to the current workspace.",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path of the file to read"
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        strict: true,
+    }]
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +169,29 @@ struct EventEnvelope {
 #[derive(Debug, Deserialize)]
 struct TextDeltaEvent {
     delta: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OutputItemDoneEvent {
+    item: OutputItem,
+}
+
+#[derive(Debug, Deserialize)]
+struct OutputItem {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FunctionCallDoneEvent {
+    item: FunctionCallItem,
+}
+
+#[derive(Debug, Deserialize)]
+struct FunctionCallItem {
+    call_id: String,
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +262,18 @@ fn decode_event(event: &Event) -> Result<Option<StreamEvent>, ProviderError> {
         "response.output_text.delta" => {
             let event: TextDeltaEvent = parse_known_event(&kind, &event.data)?;
             Ok(Some(StreamEvent::TextDelta(event.delta)))
+        }
+        "response.output_item.done" => {
+            let output: OutputItemDoneEvent = parse_known_event(&kind, &event.data)?;
+            if output.item.kind != "function_call" {
+                return Ok(None);
+            }
+            let event: FunctionCallDoneEvent = parse_known_event(&kind, &event.data)?;
+            Ok(Some(StreamEvent::ToolCallProposed(ToolCall {
+                call_id: event.item.call_id,
+                name: event.item.name,
+                arguments: event.item.arguments,
+            })))
         }
         "response.completed" => {
             let event: CompletedEvent = parse_known_event(&kind, &event.data)?;
@@ -326,10 +421,10 @@ pub enum ProviderError {
 mod tests {
     use super::{
         BoundedBodyBuffer, CreateResponseRequest, MAX_ERROR_BODY_BYTES, OpenAiClient,
-        ProviderError, decode_stream, read_api_key,
+        ProviderError, decode_stream, proposal_tools, read_api_key,
     };
     use crate::message::Message;
-    use crate::stream::{Completion, StreamEvent};
+    use crate::stream::{Completion, StreamEvent, ToolCall};
     use futures_util::{Stream, StreamExt, stream};
     use reqwest::header::AUTHORIZATION;
     use serde_json::json;
@@ -350,6 +445,7 @@ mod tests {
             input: &messages,
             store: false,
             stream: true,
+            tools: &[],
         };
 
         assert_eq!(
@@ -409,6 +505,23 @@ mod tests {
         assert_eq!(
             fixture_events([fixture.as_bytes().to_vec()]).await.unwrap(),
             [StreamEvent::TextDelta("kept".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn decodes_completed_function_call_items_as_proposals() {
+        let fixture = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}}\n\n"
+        );
+
+        assert_eq!(
+            fixture_events([fixture.as_bytes().to_vec()]).await.unwrap(),
+            [StreamEvent::ToolCallProposed(ToolCall {
+                call_id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"Cargo.toml\"}".to_owned(),
+            })]
         );
     }
 
@@ -503,6 +616,32 @@ mod tests {
                 "store": false,
                 "stream": true
             })
+        );
+    }
+
+    #[test]
+    fn builds_a_strict_read_file_proposal_tool() {
+        let client = OpenAiClient::new(
+            "https://example.test/v1",
+            "test-secret".to_owned(),
+            "test-model",
+        );
+        let tools = proposal_tools();
+        let request = client
+            .build_request_with_tools("Be helpful", &[Message::user("Inspect Cargo.toml")], &tools)
+            .unwrap();
+        let body = serde_json::from_slice::<serde_json::Value>(
+            request.body().and_then(reqwest::Body::as_bytes).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "read_file");
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tools"][0]["parameters"]["required"], json!(["path"]));
+        assert_eq!(
+            body["tools"][0]["parameters"]["additionalProperties"],
+            false
         );
     }
 

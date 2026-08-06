@@ -24,7 +24,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process;
 use store::{Store, StoreError};
-use stream::{Completion, StreamEvent};
+use stream::{Completion, StreamEvent, ToolCall};
 use terminal::InputSuppression;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
@@ -394,7 +394,7 @@ async fn stream_room_response_ui(
     terminal_events: &mut EventStream,
     state: &mut RoomUi,
 ) -> Result<Option<AssistantResponse>, AppError> {
-    let request = client.stream(system_prompt, messages);
+    let request = client.stream_with_tool_proposals(system_prompt, messages);
     tokio::pin!(request);
     let mut events = loop {
         tokio::select! {
@@ -423,6 +423,13 @@ async fn stream_room_response_ui(
                             state.push_response_delta(&visible);
                             terminal.draw(state)?;
                         }
+                    }
+                    Some(Ok(StreamEvent::ToolCallProposed(call))) => {
+                        let pending = filter.finish();
+                        append_ui_response(state, &mut message, &pending);
+                        let proposal = format_tool_proposal(&call);
+                        append_ui_response(state, &mut message, &proposal);
+                        terminal.draw(state)?;
                     }
                     Some(Ok(StreamEvent::Completed(completion))) => {
                         let visible = filter.finish();
@@ -609,7 +616,9 @@ async fn render_room_response(
     messages: &[Message],
     output: &mut impl Write,
 ) -> Result<AssistantResponse, AppError> {
-    let events = client.stream(system_prompt, messages).await?;
+    let events = client
+        .stream_with_tool_proposals(system_prompt, messages)
+        .await?;
     write!(output, "{agent_name}> ")?;
     output.flush()?;
 
@@ -647,6 +656,10 @@ where
                 output.flush()?;
                 message.push_str(&delta);
             }
+            StreamEvent::ToolCallProposed(call) => {
+                let proposal = format_tool_proposal(&call);
+                write_response_part(output, &mut message, &proposal)?;
+            }
             StreamEvent::Completed(completion) => {
                 return Ok(AssistantResponse {
                     text: message,
@@ -680,6 +693,12 @@ where
                     message.push_str(&visible);
                 }
             }
+            StreamEvent::ToolCallProposed(call) => {
+                let pending = filter.finish();
+                write_response_part(output, &mut message, &pending)?;
+                let proposal = format_tool_proposal(&call);
+                write_response_part(output, &mut message, &proposal)?;
+            }
             StreamEvent::Completed(completion) => {
                 let visible = filter.finish();
                 output.write_all(visible.as_bytes())?;
@@ -696,6 +715,45 @@ where
     }
 
     Err(ProviderError::IncompleteStream.into())
+}
+
+fn append_ui_response(state: &mut RoomUi, message: &mut String, part: &str) {
+    if part.is_empty() {
+        return;
+    }
+    let separator = if message.is_empty() { "" } else { "\n\n" };
+    message.push_str(separator);
+    message.push_str(part);
+    state.push_response_delta(separator);
+    state.push_response_delta(part);
+}
+
+fn write_response_part(
+    output: &mut impl Write,
+    message: &mut String,
+    part: &str,
+) -> io::Result<()> {
+    if part.is_empty() {
+        return Ok(());
+    }
+    if !message.is_empty() {
+        output.write_all(b"\n\n")?;
+        message.push_str("\n\n");
+    }
+    output.write_all(part.as_bytes())?;
+    output.flush()?;
+    message.push_str(part);
+    Ok(())
+}
+
+fn format_tool_proposal(call: &ToolCall) -> String {
+    let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .map(|arguments| serde_json::to_string_pretty(&arguments).expect("JSON value serializes"))
+        .unwrap_or_else(|_| call.arguments.clone());
+    format!(
+        "[tool proposal — not executed]\n{} {}",
+        call.name, arguments
+    )
 }
 
 struct LeadingAttributionFilter {
@@ -836,7 +894,7 @@ mod tests {
     use crate::config::Config;
     use crate::openai::{ProviderError, decode_stream};
     use crate::room::RoomMessage;
-    use crate::stream::{Completion, StreamEvent};
+    use crate::stream::{Completion, StreamEvent, ToolCall};
     use futures_util::stream;
     use std::ffi::OsString;
     use std::fs;
@@ -1099,6 +1157,28 @@ mod tests {
 
         assert_eq!(message.text, "@exploration continues");
         assert_eq!(String::from_utf8(output).unwrap(), message.text);
+    }
+
+    #[tokio::test]
+    async fn room_tool_proposals_are_visible_stored_text_and_never_executed() {
+        let events = stream::iter([
+            Ok(StreamEvent::ToolCallProposed(ToolCall {
+                call_id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"Cargo.toml\"}".to_owned(),
+            })),
+            Ok(StreamEvent::Completed(completion())),
+        ]);
+        let mut output = Vec::new();
+
+        let message = render_room_events(events, "explorer", &mut output)
+            .await
+            .unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), message.text);
+        assert!(message.text.contains("[tool proposal — not executed]"));
+        assert!(message.text.contains("read_file"));
+        assert!(message.text.contains("Cargo.toml"));
     }
 
     #[tokio::test]
