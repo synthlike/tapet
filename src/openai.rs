@@ -182,7 +182,7 @@ struct FunctionTool {
     strict: bool,
 }
 
-fn available_tools() -> [FunctionTool; 3] {
+fn available_tools() -> [FunctionTool; 4] {
     [
         FunctionTool {
             kind: "function",
@@ -235,6 +235,27 @@ fn available_tools() -> [FunctionTool; 3] {
                     }
                 },
                 "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+            strict: true,
+        },
+        FunctionTool {
+            kind: "function",
+            name: "search_files",
+            description: "Search text files under a workspace-relative directory for a literal, case-sensitive substring, after the user approves access. Returns matching file paths, line numbers, and line content.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Literal substring to search for (case-sensitive)"
+                    },
+                    "path": {
+                        "type": ["string", "null"],
+                        "description": "Workspace-relative directory to search; omit or null to search the whole workspace"
+                    }
+                },
+                "required": ["query", "path"],
                 "additionalProperties": false
             }),
             strict: true,
@@ -747,6 +768,13 @@ mod tests {
         assert_eq!(body["tools"][1]["name"], "list_files");
         assert_eq!(body["tools"][1]["strict"], true);
         assert_eq!(body["tools"][1]["parameters"]["required"], json!(["path"]));
+        assert_eq!(body["tools"][3]["type"], "function");
+        assert_eq!(body["tools"][3]["name"], "search_files");
+        assert_eq!(body["tools"][3]["strict"], true);
+        assert_eq!(
+            body["tools"][3]["parameters"]["required"],
+            json!(["query", "path"])
+        );
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     }
 

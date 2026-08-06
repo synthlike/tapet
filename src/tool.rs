@@ -8,6 +8,8 @@ use thiserror::Error;
 pub const MAX_TOOL_CALLS_PER_TURN: usize = 4;
 const MAX_FILE_BYTES: u64 = 128 * 1024;
 const MAX_LIST_ENTRIES: usize = 500;
+const MAX_SEARCH_MATCHES: usize = 200;
+const MAX_MATCH_LINE_CHARS: usize = 200;
 
 /// A parsed, validated request for one of the tools exposed to agents.
 /// Dispatch lives here rather than in `main.rs` so approval copy and
@@ -17,6 +19,7 @@ pub enum ToolRequest {
     ReadFile(ReadFileRequest),
     ListFiles(ListFilesRequest),
     WriteFile(WriteFileRequest),
+    SearchFiles(SearchFilesRequest),
 }
 
 pub struct ToolOutcome {
@@ -60,6 +63,7 @@ impl ToolRequest {
             "read_file" => Ok(Self::ReadFile(ReadFileRequest::parse(arguments)?)),
             "list_files" => Ok(Self::ListFiles(ListFilesRequest::parse(arguments)?)),
             "write_file" => Ok(Self::WriteFile(WriteFileRequest::parse(arguments)?)),
+            "search_files" => Ok(Self::SearchFiles(SearchFilesRequest::parse(arguments)?)),
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
     }
@@ -69,6 +73,7 @@ impl ToolRequest {
             Self::ReadFile(_) => "read",
             Self::ListFiles(_) => "list",
             Self::WriteFile(_) => "write",
+            Self::SearchFiles(_) => "search",
         }
     }
 
@@ -78,6 +83,8 @@ impl ToolRequest {
             (Self::ReadFile(_) | Self::WriteFile(_), _) => "lines",
             (Self::ListFiles(_), 1) => "entry",
             (Self::ListFiles(_), _) => "entries",
+            (Self::SearchFiles(_), 1) => "match",
+            (Self::SearchFiles(_), _) => "matches",
         }
     }
 
@@ -86,6 +93,7 @@ impl ToolRequest {
             Self::ReadFile(request) => request.display_path(),
             Self::ListFiles(request) => request.display_path(),
             Self::WriteFile(request) => request.display_path(),
+            Self::SearchFiles(request) => request.display_path(),
         }
     }
 
@@ -104,6 +112,7 @@ impl ToolRequest {
             Self::ReadFile(request) => request.execute(workspace).map(ToolOutcome::from),
             Self::ListFiles(request) => request.execute(workspace).map(ToolOutcome::from),
             Self::WriteFile(request) => request.execute(workspace).map(ToolOutcome::from),
+            Self::SearchFiles(request) => request.execute(workspace).map(ToolOutcome::from),
         }
     }
 }
@@ -134,6 +143,20 @@ impl From<WriteFileOutput> for ToolOutcome {
             bytes: output.bytes,
             lines: output.lines,
             json: serde_json::to_string(&output).expect("write_file output is serializable"),
+        }
+    }
+}
+
+impl From<SearchFilesOutput> for ToolOutcome {
+    fn from(output: SearchFilesOutput) -> Self {
+        Self {
+            bytes: output
+                .matches
+                .iter()
+                .map(|entry| entry.content.len() as u64)
+                .sum(),
+            lines: output.matches.len() as u64,
+            json: serde_json::to_string(&output).expect("search_files output is serializable"),
         }
     }
 }
@@ -386,6 +409,162 @@ impl WriteFileRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchFilesRequest {
+    query: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchFilesArguments {
+    query: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchMatch {
+    pub path: String,
+    pub line: u64,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchFilesOutput {
+    pub ok: bool,
+    pub query: String,
+    pub matches: Vec<SearchMatch>,
+}
+
+impl SearchFilesRequest {
+    pub fn parse(arguments: &str) -> Result<Self, ToolError> {
+        let arguments: SearchFilesArguments = serde_json::from_str(arguments)?;
+        if arguments.query.is_empty() {
+            return Err(ToolError::EmptyQuery);
+        }
+        let path = parse_workspace_path(arguments.path.as_deref().unwrap_or("."))?;
+
+        Ok(Self {
+            query: arguments.query,
+            path,
+        })
+    }
+
+    pub fn display_path(&self) -> String {
+        format!("{:?} in {}", self.query, display_workspace_path(&self.path))
+    }
+
+    pub fn execute(&self, workspace: &Path) -> Result<SearchFilesOutput, ToolError> {
+        let workspace_root = workspace
+            .canonicalize()
+            .map_err(|source| ToolError::Workspace { source })?;
+        let resolved_root = resolve_within_workspace(workspace, &self.path, &self.display_path())?;
+        if !resolved_root.is_dir() {
+            return Err(ToolError::NotADirectory(self.display_path()));
+        }
+
+        let mut matches = Vec::new();
+        let mut directories = vec![resolved_root];
+        while let Some(directory) = directories.pop() {
+            let entries = fs::read_dir(&directory).map_err(|source| ToolError::Open {
+                path: self.display_path(),
+                source,
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|source| ToolError::Read {
+                    path: self.display_path(),
+                    source,
+                })?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if is_sensitive_component(&name) {
+                    continue;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    if !is_noisy_directory(&name) {
+                        directories.push(entry.path());
+                    }
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue; // symlinks and other special entries
+                }
+                self.search_file(&entry.path(), &workspace_root, &mut matches)?;
+            }
+        }
+
+        Ok(SearchFilesOutput {
+            ok: true,
+            query: self.query.clone(),
+            matches,
+        })
+    }
+
+    fn search_file(
+        &self,
+        path: &Path,
+        workspace_root: &Path,
+        matches: &mut Vec<SearchMatch>,
+    ) -> Result<(), ToolError> {
+        let Ok(metadata) = fs::metadata(path) else {
+            return Ok(());
+        };
+        if metadata.len() > MAX_FILE_BYTES {
+            return Ok(());
+        }
+        let Ok(bytes) = fs::read(path) else {
+            return Ok(());
+        };
+        let Ok(content) = String::from_utf8(bytes) else {
+            return Ok(());
+        };
+        let relative = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+
+        for (index, line) in content.lines().enumerate() {
+            if !line.contains(&self.query) {
+                continue;
+            }
+            matches.push(SearchMatch {
+                path: relative.clone(),
+                line: (index + 1) as u64,
+                content: truncate_match_line(line),
+            });
+            if matches.len() > MAX_SEARCH_MATCHES {
+                return Err(ToolError::TooManyMatches {
+                    query: self.query.clone(),
+                    limit: MAX_SEARCH_MATCHES,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn truncate_match_line(line: &str) -> String {
+    if line.chars().count() <= MAX_MATCH_LINE_CHARS {
+        line.to_owned()
+    } else {
+        let mut truncated: String = line.chars().take(MAX_MATCH_LINE_CHARS).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
+fn is_noisy_directory(name: &str) -> bool {
+    matches!(
+        name,
+        "target" | "node_modules" | ".venv" | "venv" | "dist" | "build" | "__pycache__"
+    )
+}
+
 fn validate_write_size(content: &str, display: &str) -> Result<(), ToolError> {
     if content.len() as u64 > MAX_FILE_BYTES {
         return Err(ToolError::TooLarge {
@@ -589,6 +768,10 @@ pub enum ToolError {
     TooLarge { path: String, limit: u64 },
     #[error("`{path}` has more than {limit} entries")]
     TooManyEntries { path: String, limit: usize },
+    #[error("search query must not be empty")]
+    EmptyQuery,
+    #[error("more than {limit} matches for `{query}`; narrow the query or path")]
+    TooManyMatches { query: String, limit: usize },
     #[error("could not read `{path}`: {source}")]
     Read { path: String, source: io::Error },
     #[error("could not write `{path}`: {source}")]
@@ -600,8 +783,8 @@ pub enum ToolError {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiffLineKind, ListFilesRequest, ReadFileRequest, ToolApprovalPreview, ToolError,
-        ToolRequest, WriteFileRequest,
+        DiffLineKind, ListFilesRequest, MAX_SEARCH_MATCHES, ReadFileRequest, SearchFilesRequest,
+        ToolApprovalPreview, ToolError, ToolRequest, WriteFileRequest,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -862,6 +1045,64 @@ mod tests {
         assert!(matches!(
             request.execute(workspace.path()),
             Err(ToolError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn finds_matches_across_nested_files_with_line_numbers() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "fn one() {}\nfn two() { todo!() }\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("README.md"), "no matches here\n").unwrap();
+
+        let request = SearchFilesRequest::parse(r#"{"query":"todo!","path":null}"#).unwrap();
+        let output = request.execute(workspace.path()).unwrap();
+
+        assert_eq!(output.matches.len(), 1);
+        assert_eq!(output.matches[0].path, "src/lib.rs");
+        assert_eq!(output.matches[0].line, 2);
+        assert_eq!(output.matches[0].content, "fn two() { todo!() }");
+    }
+
+    #[test]
+    fn search_skips_sensitive_and_noisy_directories_and_binary_files() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join(".git")).unwrap();
+        fs::write(workspace.path().join(".git/config"), "secret todo").unwrap();
+        fs::create_dir(workspace.path().join("target")).unwrap();
+        fs::write(workspace.path().join("target/output"), "built todo").unwrap();
+        fs::write(
+            workspace.path().join("binary"),
+            [0xff, 0xfe, b't', b'o', b'd', b'o'],
+        )
+        .unwrap();
+        fs::write(workspace.path().join("visible.txt"), "a todo here\n").unwrap();
+
+        let request = SearchFilesRequest::parse(r#"{"query":"todo","path":"."}"#).unwrap();
+        let output = request.execute(workspace.path()).unwrap();
+
+        assert_eq!(output.matches.len(), 1);
+        assert_eq!(output.matches[0].path, "visible.txt");
+    }
+
+    #[test]
+    fn rejects_empty_queries_and_too_many_matches() {
+        assert!(matches!(
+            SearchFilesRequest::parse(r#"{"query":"","path":null}"#),
+            Err(ToolError::EmptyQuery)
+        ));
+
+        let workspace = TempDir::new().unwrap();
+        let content = "todo\n".repeat(MAX_SEARCH_MATCHES + 1);
+        fs::write(workspace.path().join("many.txt"), content).unwrap();
+        let request = SearchFilesRequest::parse(r#"{"query":"todo","path":null}"#).unwrap();
+        assert!(matches!(
+            request.execute(workspace.path()),
+            Err(ToolError::TooManyMatches { .. })
         ));
     }
 }

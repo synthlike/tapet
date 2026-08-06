@@ -57,10 +57,13 @@ history, Tab completion for `@agent` mentions and `/` commands, and slash
 commands (`/agents`, `/add <agent>`, `/help`, `/exit`) to manage the room
 without leaving it.
 
-Agents may also request the `read_file`, `list_files`, and `write_file` tools
-to inspect or change the workspace — `write_file` shows a diff to approve
-before anything is written. Every use pauses for a `[y]/[n]` approval and is
-logged to SQLite for auditing; nothing runs when input or output is redirected.
+Agents may also request the `read_file`, `list_files`, `write_file`, and
+`search_files` tools to inspect, search, or change the workspace —
+`write_file` shows a diff to approve before anything is written, and
+`search_files` does a literal, case-sensitive substring search across a
+directory (skipping `.git`, build/dependency directories, and binary files).
+Every use pauses for a `[y]/[n]` approval and is logged to SQLite for
+auditing; nothing runs when input or output is redirected.
 
 ## Configuration
 
