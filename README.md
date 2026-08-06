@@ -15,6 +15,22 @@ ideas and solve problems.
 
 ![Tapet room with explorer, doubter, and synthesizer agents](screenshots/tapet.png)
 
+## Install
+
+Requires Rust ([rustup.rs](https://rustup.rs)).
+
+```sh
+cargo install --git https://github.com/synthlike/tapet
+```
+
+Or from a local checkout:
+
+```sh
+git clone https://github.com/synthlike/tapet
+cd tapet
+cargo install --path .
+```
+
 ## Usage
 
 Configure providers, model aliases, and agents in `tapet.toml`, then export the
