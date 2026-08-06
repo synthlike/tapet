@@ -116,6 +116,7 @@ pub struct Agent {
     api_key_env: String,
     model: String,
     prompt: String,
+    can_call: Vec<String>,
 }
 
 impl Agent {
@@ -145,6 +146,12 @@ impl Agent {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    /// Agents this agent may target with `call_agent`. Empty by default —
+    /// delegation is opt-in per agent.
+    pub fn can_call(&self) -> &[String] {
+        &self.can_call
     }
 }
 
@@ -186,6 +193,8 @@ struct RawAgent {
     model: String,
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
+    #[serde(default)]
+    can_call: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +254,10 @@ pub enum ConfigError {
         name: String,
         available: Vec<String>,
     },
+    UnknownCallTarget {
+        agent: String,
+        target: String,
+    },
     UnknownRoomAgent {
         room: String,
         agent: String,
@@ -302,6 +315,7 @@ impl Config {
                         model: model_alias.clone(),
                         provider: model.provider.clone(),
                     })?;
+            let can_call = raw_agent.can_call.clone();
             let prompt = resolve_prompt(&name, raw_agent, base_dir)?;
             agents.insert(
                 name.clone(),
@@ -313,8 +327,20 @@ impl Config {
                     api_key_env: provider.api_key_env.clone(),
                     model: model.model.clone(),
                     prompt,
+                    can_call,
                 },
             );
+        }
+
+        for agent in agents.values() {
+            for target in agent.can_call() {
+                if !agents.contains_key(target) {
+                    return Err(ConfigError::UnknownCallTarget {
+                        agent: agent.name().to_owned(),
+                        target: target.clone(),
+                    });
+                }
+            }
         }
 
         let mut rooms = BTreeMap::new();
@@ -595,6 +621,10 @@ impl fmt::Display for ConfigError {
                 "unknown agent `{name}`; available agents: {}",
                 available.join(", ")
             ),
+            Self::UnknownCallTarget { agent, target } => write!(
+                formatter,
+                "agent `{agent}` has `can_call` entry `{target}`, which is not a known agent"
+            ),
             Self::UnknownRoomAgent { room, agent } => {
                 write!(
                     formatter,
@@ -821,6 +851,35 @@ mod tests {
         assert!(matches!(
             Config::load(invalid_category),
             Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn resolves_and_validates_can_call() {
+        let directory = TestDirectory::new();
+        let path = directory.write(
+            "tapet.toml",
+            &configuration(concat!(
+                "[agents.architect]\nmodel = \"primary\"\nprompt = \"Plan\"\n",
+                "can_call = [\"dev\"]\n",
+                "[agents.dev]\nmodel = \"primary\"\nprompt = \"Build\"\n",
+            )),
+        );
+        let config = Config::load(path).unwrap();
+        assert_eq!(config.agent("architect").unwrap().can_call(), ["dev"]);
+        assert!(config.agent("dev").unwrap().can_call().is_empty());
+
+        let unknown_target = directory.write(
+            "unknown-call-target.toml",
+            &configuration(concat!(
+                "[agents.architect]\nmodel = \"primary\"\nprompt = \"Plan\"\n",
+                "can_call = [\"ghost\"]\n",
+            )),
+        );
+        assert!(matches!(
+            Config::load(unknown_target),
+            Err(ConfigError::UnknownCallTarget { agent, target })
+                if agent == "architect" && target == "ghost"
         ));
     }
 

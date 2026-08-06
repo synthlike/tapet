@@ -198,7 +198,7 @@ fn tools_for(permissions: Option<&[Permission]>) -> Vec<FunctionTool> {
     }
 }
 
-fn available_tools() -> [FunctionTool; 4] {
+fn available_tools() -> [FunctionTool; 5] {
     [
         FunctionTool {
             kind: "function",
@@ -276,6 +276,28 @@ fn available_tools() -> [FunctionTool; 4] {
                     }
                 },
                 "required": ["query", "path"],
+                "additionalProperties": false
+            }),
+            strict: true,
+        },
+        FunctionTool {
+            kind: "function",
+            name: "call_agent",
+            category: Permission::Call,
+            description: "Delegate a bounded task to another configured agent and get its response back, after the user approves. Only agents listed in your `can_call` config may be targeted.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Name of the configured agent to delegate to"
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The bounded task to hand off, sent as the target agent's first message"
+                    }
+                },
+                "required": ["agent", "task"],
                 "additionalProperties": false
             }),
             strict: true,
@@ -796,13 +818,20 @@ mod tests {
             body["tools"][3]["parameters"]["required"],
             json!(["query", "path"])
         );
+        assert_eq!(body["tools"][4]["type"], "function");
+        assert_eq!(body["tools"][4]["name"], "call_agent");
+        assert_eq!(body["tools"][4]["strict"], true);
+        assert_eq!(
+            body["tools"][4]["parameters"]["required"],
+            json!(["agent", "task"])
+        );
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     }
 
     #[test]
     fn tools_for_filters_by_granted_permission() {
         let unrestricted = tools_for(None);
-        assert_eq!(unrestricted.len(), 4);
+        assert_eq!(unrestricted.len(), 5);
 
         let read_only = tools_for(Some(&[Permission::Read]));
         let names: Vec<_> = read_only.iter().map(|tool| tool.name).collect();
@@ -814,6 +843,10 @@ mod tests {
         let write_only = tools_for(Some(&[Permission::Write]));
         let names: Vec<_> = write_only.iter().map(|tool| tool.name).collect();
         assert_eq!(names, ["write_file"]);
+
+        let call_only = tools_for(Some(&[Permission::Call]));
+        let names: Vec<_> = call_only.iter().map(|tool| tool.name).collect();
+        assert_eq!(names, ["call_agent"]);
     }
 
     #[test]

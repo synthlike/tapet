@@ -34,6 +34,11 @@ use ui::{InputAction, RoomUi, TerminalUi};
 
 const CONFIG_PATH: &str = "tapet.toml";
 const DATABASE_PATH: &str = ".tapet/tapet.db";
+/// How many `call_agent` hops a single user turn may chain (intake ->
+/// architect -> developer -> tester is 3 hops). Not a full budget system —
+/// just a hard cap so a delegation cycle in `can_call` terminates instead
+/// of looping forever.
+const MAX_CALL_AGENT_DEPTH: usize = 3;
 
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Tapet configuration.
 version = 1
@@ -65,9 +70,11 @@ prompt = "Be concise and helpful."
 [rooms.chat.permissions]
 assistant = ["read", "write"]
 
-# Add more [agents.*] and [rooms.*] as needed. See
+# Add more [agents.*] and [rooms.*] as needed. Once you have more than one
+# agent, `can_call` on an agent plus the "call" permission lets it delegate
+# bounded tasks to another agent via the call_agent tool. See
 # https://github.com/synthlike/tapet for a full example with multiple
-# agents and a room template.
+# agents, a room template, and agent-to-agent delegation.
 "#;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -304,7 +311,7 @@ async fn try_main() -> Result<(), AppError> {
                 let mut output = stdout.lock();
                 writeln!(output, "Starting new room: {}", room.name())?;
                 write_room_ready(&room, &mut output)?;
-                run_room(store, room, input, output).await?;
+                run_room(store, room, input, output, &config_path).await?;
             }
         }
         Command::Enter { room: name } => {
@@ -321,7 +328,7 @@ async fn try_main() -> Result<(), AppError> {
                 let mut output = stdout.lock();
                 writeln!(output, "Room {}", room.name())?;
                 write_room_history(&messages, &mut output)?;
-                run_room(store, room, input, output).await?;
+                run_room(store, room, input, output, &config_path).await?;
             }
         }
         Command::History { room: name } => {
@@ -448,6 +455,7 @@ async fn run_room_ui(
                     &mut terminal,
                     &mut terminal_events,
                     &mut state,
+                    config_path,
                 )
                 .await?
                 {
@@ -511,6 +519,7 @@ async fn run_room_ui_turn(
     terminal: &mut TerminalUi,
     terminal_events: &mut EventStream,
     state: &mut RoomUi,
+    config_path: &Path,
 ) -> Result<bool, AppError> {
     let room_message = RoomMessage::user(message);
     let targets = match room.route(&room_message) {
@@ -570,6 +579,8 @@ async fn run_room_ui_turn(
                 store,
                 room_call_id: call_id,
                 permissions: participant.permissions(),
+                config_path,
+                depth: 0,
             };
             stream_room_response_ui(
                 &target,
@@ -619,11 +630,15 @@ struct ActiveRoomUi<'a> {
 }
 
 /// Per-turn context threaded through a single model call: where to persist
-/// it and what the calling participant is permitted to do without a prompt.
+/// it, what the calling participant is permitted to do without a prompt,
+/// and (for `call_agent`) how to resolve further agents and how deep the
+/// current delegation chain already is.
 struct RoomCallContext<'a> {
     store: &'a Store,
     room_call_id: i64,
     permissions: Option<&'a [Permission]>,
+    config_path: &'a Path,
+    depth: usize,
 }
 
 async fn stream_room_response_ui(
@@ -692,9 +707,7 @@ async fn stream_room_response_ui(
                 continue;
             }
             tool_calls += 1;
-            let Some(output) =
-                run_tool_ui(agent_name, &call, record_id, store, permissions, ui).await?
-            else {
+            let Some(output) = run_tool_ui(agent_name, &call, record_id, context, ui).await? else {
                 return Ok(None);
             };
             input.append_function_output(&call.call_id, output);
@@ -762,10 +775,12 @@ async fn run_tool_ui(
     agent_name: &str,
     call: &ToolCall,
     record_id: i64,
-    store: &Store,
-    permissions: Option<&[Permission]>,
+    context: &RoomCallContext<'_>,
     ui: &mut ActiveRoomUi<'_>,
 ) -> Result<Option<String>, AppError> {
+    let store = context.store;
+    let permissions = context.permissions;
+
     let request = match ToolRequest::parse(&call.name, &call.arguments) {
         Ok(request) => request,
         Err(error) => {
@@ -790,6 +805,55 @@ async fn run_tool_ui(
         return Ok(Some(error_output(&error)));
     }
     let auto_approved = permissions.is_some();
+
+    if let ToolRequest::CallAgent(call_request) = &request {
+        if context.depth >= MAX_CALL_AGENT_DEPTH {
+            let error = format!(
+                "delegation depth limit ({MAX_CALL_AGENT_DEPTH}) reached; @{agent_name} cannot call @{}",
+                call_request.agent()
+            );
+            store.fail_tool_call(record_id, error.clone()).await?;
+            ui.state.push_tool_notice(format!("✗ {error}"));
+            return Ok(Some(error_output(&error)));
+        }
+        let config = match Config::load(context.config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                store.fail_tool_call(record_id, error.to_string()).await?;
+                ui.state
+                    .push_tool_notice(format!("✗ @{agent_name} {verb} {path} · {error}"));
+                return Ok(Some(error_output(&error)));
+            }
+        };
+        let caller = match config.agent(agent_name) {
+            Ok(agent) => agent,
+            Err(error) => {
+                store.fail_tool_call(record_id, error.to_string()).await?;
+                ui.state
+                    .push_tool_notice(format!("✗ @{agent_name} {verb} {path} · {error}"));
+                return Ok(Some(error_output(&error)));
+            }
+        };
+        if !caller
+            .can_call()
+            .iter()
+            .any(|name| name == call_request.agent())
+        {
+            let error = format!(
+                "@{agent_name} is not allowed to call @{}",
+                call_request.agent()
+            );
+            store.fail_tool_call(record_id, error.clone()).await?;
+            ui.state.push_tool_notice(format!("✗ {error}"));
+            return Ok(Some(error_output(&error)));
+        }
+        if let Err(error) = config.agent(call_request.agent()) {
+            store.fail_tool_call(record_id, error.to_string()).await?;
+            ui.state
+                .push_tool_notice(format!("✗ @{agent_name} {verb} {path} · {error}"));
+            return Ok(Some(error_output(&error)));
+        }
+    }
 
     let workspace = env::current_dir()?;
     let preview = match request.approval_preview(&workspace) {
@@ -854,6 +918,11 @@ async fn run_tool_ui(
     ui.state
         .set_status(format!("@{agent_name} is {verb}ing {path}..."));
     ui.terminal.draw(ui.state)?;
+
+    if let ToolRequest::CallAgent(call_request) = &request {
+        return run_call_agent_ui(agent_name, call_request, record_id, &path, context, ui).await;
+    }
+
     let request_for_label = request.clone();
     let task = tokio::task::spawn_blocking(move || request.execute(&workspace));
     tokio::pin!(task);
@@ -902,6 +971,127 @@ async fn run_tool_ui(
     }
 }
 
+/// Runs a `call_agent` delegation as a nested, one-shot turn: the target
+/// agent's own system prompt plus the task as its sole message, going
+/// through the same tool-call loop (and thus the same approvals and
+/// budget) a normal turn uses. The caller has already been approved by
+/// the time this runs; this only handles execution and bookkeeping.
+async fn run_call_agent_ui(
+    caller_name: &str,
+    request: &tool::CallAgentRequest,
+    record_id: i64,
+    path: &str,
+    context: &RoomCallContext<'_>,
+    ui: &mut ActiveRoomUi<'_>,
+) -> Result<Option<String>, AppError> {
+    let store = context.store;
+    let callee_name = request.agent();
+
+    let config = match Config::load(context.config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            store.fail_tool_call(record_id, error.to_string()).await?;
+            ui.state
+                .push_tool_notice(format!("✗ @{caller_name} call {path} · {error}"));
+            return Ok(Some(error_output(&error)));
+        }
+    };
+    let callee_agent = match config.agent(callee_name) {
+        Ok(agent) => agent,
+        Err(error) => {
+            store.fail_tool_call(record_id, error.to_string()).await?;
+            ui.state
+                .push_tool_notice(format!("✗ @{caller_name} call {path} · {error}"));
+            return Ok(Some(error_output(&error)));
+        }
+    };
+    // Delegated calls always run unrestricted: the callee isn't necessarily
+    // a participant in any room with a permissions table of its own, so
+    // its own tool use always prompts, regardless of the caller's grants.
+    let callee = AgentSnapshot::resolve(callee_agent, None);
+    let client = match OpenAiClient::from_settings(
+        callee.base_url(),
+        callee.api_key_env(),
+        callee.model(),
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            store.fail_tool_call(record_id, error.to_string()).await?;
+            ui.state
+                .push_tool_notice(format!("✗ @{caller_name} call {path} · {error}"));
+            return Ok(Some(error_output(&error)));
+        }
+    };
+    let instructions = delegated_call_instructions(callee.system_prompt());
+    let messages = vec![Message::user(request.task().to_owned())];
+    let nested_context = RoomCallContext {
+        store,
+        room_call_id: context.room_call_id,
+        permissions: None,
+        config_path: context.config_path,
+        depth: context.depth + 1,
+    };
+
+    ui.state.begin_response(callee_name);
+    ui.terminal.draw(ui.state)?;
+    // `stream_room_response_ui` -> `run_tool_ui` -> `run_call_agent_ui` can
+    // recurse back into `stream_room_response_ui` for a nested delegation,
+    // so this call needs boxing to give the future a finite size.
+    let outcome = Box::pin(stream_room_response_ui(
+        callee_name,
+        &instructions,
+        &client,
+        &messages,
+        &nested_context,
+        ui,
+    ))
+    .await;
+
+    match outcome {
+        Ok(Some(response)) => {
+            ui.state.finish_response(callee_name, response.text.clone());
+            ui.state.begin_response(caller_name);
+            let payload = serde_json::json!({
+                "ok": true,
+                "agent": callee_name,
+                "response": response.text,
+            });
+            let bytes = response.text.len() as u64;
+            let lines = response.text.lines().count().max(1) as u64;
+            store.complete_tool_call(record_id, bytes, lines).await?;
+            ui.state.push_tool_notice(format!(
+                "✓ @{caller_name} call {path} · {} {}",
+                lines,
+                if lines == 1 { "line" } else { "lines" }
+            ));
+            ui.terminal.draw(ui.state)?;
+            Ok(Some(payload.to_string()))
+        }
+        Ok(None) => {
+            store
+                .fail_tool_call(record_id, "cancelled by user".to_owned())
+                .await?;
+            Ok(None)
+        }
+        Err(error) => {
+            ui.state.discard_response();
+            ui.state.begin_response(caller_name);
+            store.fail_tool_call(record_id, error.to_string()).await?;
+            ui.state
+                .push_tool_notice(format!("✗ @{caller_name} call {path} · {error}"));
+            ui.terminal.draw(ui.state)?;
+            Ok(Some(error_output(&error)))
+        }
+    }
+}
+
+fn delegated_call_instructions(system_prompt: &str) -> String {
+    format!(
+        "{system_prompt}\n\nYou were delegated a bounded task by another agent via a tool call, not addressed directly by a user. Complete it and give your final answer as your response. There is no shared room transcript for this task — don't reference other participants or expect a reply.\n\n{}",
+        room::TOOL_USAGE_NOTE
+    )
+}
+
 fn add_usage(total: &mut Completion, round: &Completion) {
     total
         .provider_response_id
@@ -943,6 +1133,7 @@ async fn run_room(
     room: Room,
     mut input: impl AsyncBufRead + Unpin,
     mut output: impl Write,
+    config_path: &Path,
 ) -> Result<(), AppError> {
     loop {
         let input_action = tokio::select! {
@@ -1005,6 +1196,8 @@ async fn run_room(
                 store: &store,
                 room_call_id: call_id,
                 permissions: participant.permissions(),
+                config_path,
+                depth: 0,
             };
             let outcome = tokio::select! {
                 result = render_room_response(

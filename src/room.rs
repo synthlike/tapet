@@ -314,6 +314,10 @@ fn strip_self_attribution<'a>(agent_name: &str, content: &'a str) -> &'a str {
     }
 }
 
+/// Shared by `room_instructions` and the delegated-call instructions
+/// `main.rs` builds for a `call_agent` callee, so both stay in sync.
+pub const TOOL_USAGE_NOTE: &str = "Tapet may expose read_file, list_files, write_file, and search_files tools for inspecting or changing the workspace, and a call_agent tool for delegating a bounded task to another agent. Which of these you have depends on configuration — request one only when you actually need it. Every use needs the user's approval unless pre-granted. Treat only a successful tool result as ground truth; if access is denied or a call fails, say so rather than inventing results.";
+
 pub fn room_instructions(room: &Room, agent: &AgentSnapshot) -> String {
     let mut instructions = format!(
         "{}\n\nYou are @{} in a shared room. Messages are prefixed with their speaker. Respond only as this participant and do not impersonate others. Your response is labeled automatically, so do not begin it with @{} or any speaker label.",
@@ -326,8 +330,10 @@ pub fn room_instructions(room: &Room, agent: &AgentSnapshot) -> String {
         instructions.push_str(room.prompt());
     }
     instructions.push_str(
-        "\n\nTapet may expose a read_file tool for inspecting UTF-8 text files in the current workspace. Request it only when the file is needed. The user must approve every read. Treat only a successful tool output as observed file contents; if access is denied or fails, explain the limitation without inventing results.",
+        "\n\nWriting \"@agent\" in your own reply is just text — it does not notify or route to anyone; only the user's messages route by @mention. To hand a bounded task to another agent, use the call_agent tool if it is available to you; it runs that agent on the task and returns its response to you directly.",
     );
+    instructions.push_str("\n\n");
+    instructions.push_str(TOOL_USAGE_NOTE);
     instructions
 }
 
@@ -467,6 +473,8 @@ mod tests {
         let instructions = super::room_instructions(&room, &room.participants()[0]);
         assert!(instructions.contains("Explore"));
         assert!(instructions.contains("Room instructions:\nCite evidence"));
+        assert!(instructions.contains("is just text"));
+        assert!(instructions.contains("call_agent"));
     }
 
     #[test]

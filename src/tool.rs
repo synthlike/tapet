@@ -21,6 +21,7 @@ pub enum ToolRequest {
     ListFiles(ListFilesRequest),
     WriteFile(WriteFileRequest),
     SearchFiles(SearchFilesRequest),
+    CallAgent(CallAgentRequest),
 }
 
 pub struct ToolOutcome {
@@ -65,6 +66,7 @@ impl ToolRequest {
             "list_files" => Ok(Self::ListFiles(ListFilesRequest::parse(arguments)?)),
             "write_file" => Ok(Self::WriteFile(WriteFileRequest::parse(arguments)?)),
             "search_files" => Ok(Self::SearchFiles(SearchFilesRequest::parse(arguments)?)),
+            "call_agent" => Ok(Self::CallAgent(CallAgentRequest::parse(arguments)?)),
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
     }
@@ -75,13 +77,14 @@ impl ToolRequest {
             Self::ListFiles(_) => "list",
             Self::WriteFile(_) => "write",
             Self::SearchFiles(_) => "search",
+            Self::CallAgent(_) => "call",
         }
     }
 
     pub fn count_label(&self, count: u64) -> &'static str {
         match (self, count) {
-            (Self::ReadFile(_) | Self::WriteFile(_), 1) => "line",
-            (Self::ReadFile(_) | Self::WriteFile(_), _) => "lines",
+            (Self::ReadFile(_) | Self::WriteFile(_) | Self::CallAgent(_), 1) => "line",
+            (Self::ReadFile(_) | Self::WriteFile(_) | Self::CallAgent(_), _) => "lines",
             (Self::ListFiles(_), 1) => "entry",
             (Self::ListFiles(_), _) => "entries",
             (Self::SearchFiles(_), 1) => "match",
@@ -94,6 +97,7 @@ impl ToolRequest {
         match self {
             Self::ReadFile(_) | Self::ListFiles(_) | Self::SearchFiles(_) => Permission::Read,
             Self::WriteFile(_) => Permission::Write,
+            Self::CallAgent(_) => Permission::Call,
         }
     }
 
@@ -103,6 +107,7 @@ impl ToolRequest {
             Self::ListFiles(request) => request.display_path(),
             Self::WriteFile(request) => request.display_path(),
             Self::SearchFiles(request) => request.display_path(),
+            Self::CallAgent(request) => request.display_path(),
         }
     }
 
@@ -116,12 +121,17 @@ impl ToolRequest {
         }
     }
 
+    /// Filesystem tools only — `call_agent` needs an async nested provider
+    /// turn plus `Config`/`OpenAiClient` access that this synchronous,
+    /// workspace-scoped path doesn't have, so `main.rs` dispatches it
+    /// separately before ever reaching here.
     pub fn execute(&self, workspace: &Path) -> Result<ToolOutcome, ToolError> {
         match self {
             Self::ReadFile(request) => request.execute(workspace).map(ToolOutcome::from),
             Self::ListFiles(request) => request.execute(workspace).map(ToolOutcome::from),
             Self::WriteFile(request) => request.execute(workspace).map(ToolOutcome::from),
             Self::SearchFiles(request) => request.execute(workspace).map(ToolOutcome::from),
+            Self::CallAgent(_) => Err(ToolError::NotFileBased),
         }
     }
 }
@@ -557,6 +567,51 @@ impl SearchFilesRequest {
     }
 }
 
+/// Delegates a bounded task to another configured agent. Parsing/validation
+/// lives here like every other tool, but there's no `execute()` — a nested
+/// provider turn needs `Config`/`OpenAiClient` and an async event loop that
+/// this module doesn't have, so `main.rs` dispatches it directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallAgentRequest {
+    agent: String,
+    task: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CallAgentArguments {
+    agent: String,
+    task: String,
+}
+
+impl CallAgentRequest {
+    pub fn parse(arguments: &str) -> Result<Self, ToolError> {
+        let arguments: CallAgentArguments = serde_json::from_str(arguments)?;
+        if arguments.agent.trim().is_empty() {
+            return Err(ToolError::EmptyAgent);
+        }
+        if arguments.task.trim().is_empty() {
+            return Err(ToolError::EmptyTask);
+        }
+        Ok(Self {
+            agent: arguments.agent,
+            task: arguments.task,
+        })
+    }
+
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    pub fn task(&self) -> &str {
+        &self.task
+    }
+
+    pub fn display_path(&self) -> String {
+        format!("@{} with task {:?}", self.agent, self.task)
+    }
+}
+
 fn truncate_match_line(line: &str) -> String {
     if line.chars().count() <= MAX_MATCH_LINE_CHARS {
         line.to_owned()
@@ -787,13 +842,19 @@ pub enum ToolError {
     Write { path: String, source: io::Error },
     #[error("`{0}` is not UTF-8 text")]
     NotUtf8(String),
+    #[error("call_agent requires a non-empty target agent")]
+    EmptyAgent,
+    #[error("call_agent requires a non-empty task")]
+    EmptyTask,
+    #[error("call_agent cannot run through the filesystem tool-execution path")]
+    NotFileBased,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DiffLineKind, ListFilesRequest, MAX_SEARCH_MATCHES, ReadFileRequest, SearchFilesRequest,
-        ToolApprovalPreview, ToolError, ToolRequest, WriteFileRequest,
+        CallAgentRequest, DiffLineKind, ListFilesRequest, MAX_SEARCH_MATCHES, ReadFileRequest,
+        SearchFilesRequest, ToolApprovalPreview, ToolError, ToolRequest, WriteFileRequest,
     };
     use crate::config::Permission;
     use std::fs;
@@ -955,10 +1016,32 @@ mod tests {
             ToolRequest::parse("search_files", r#"{"query":"a","path":null}"#).unwrap();
         let write_file = ToolRequest::parse("write_file", r#"{"path":"a","content":""}"#).unwrap();
 
+        let call_agent =
+            ToolRequest::parse("call_agent", r#"{"agent":"dev","task":"build it"}"#).unwrap();
+
         assert_eq!(read_file.permission(), Permission::Read);
         assert_eq!(list_files.permission(), Permission::Read);
         assert_eq!(search_files.permission(), Permission::Read);
         assert_eq!(write_file.permission(), Permission::Write);
+        assert_eq!(call_agent.permission(), Permission::Call);
+    }
+
+    #[test]
+    fn parses_call_agent_and_rejects_empty_fields() {
+        let request =
+            CallAgentRequest::parse(r#"{"agent":"dev","task":"build the thing"}"#).unwrap();
+        assert_eq!(request.agent(), "dev");
+        assert_eq!(request.task(), "build the thing");
+        assert_eq!(request.display_path(), "@dev with task \"build the thing\"");
+
+        assert!(matches!(
+            CallAgentRequest::parse(r#"{"agent":"","task":"build it"}"#),
+            Err(ToolError::EmptyAgent)
+        ));
+        assert!(matches!(
+            CallAgentRequest::parse(r#"{"agent":"dev","task":""}"#),
+            Err(ToolError::EmptyTask)
+        ));
     }
 
     #[test]
