@@ -1,3 +1,4 @@
+use crate::room::BROADCAST_MENTION;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
@@ -428,6 +429,9 @@ fn validate_name(kind: &'static str, name: &str) -> Result<(), &'static str> {
             _ => "room names may contain only ASCII letters, digits, `_`, and `-`",
         });
     }
+    if kind == "agent" && name == BROADCAST_MENTION {
+        return Err("agent names cannot be `all`; it is reserved for the @all broadcast mention");
+    }
     Ok(())
 }
 
@@ -829,6 +833,16 @@ mod tests {
             Config::load(unmentionable_name),
             Err(ConfigError::InvalidAgent { reason, .. })
                 if reason == "agent names may contain only ASCII letters, digits, `_`, and `-`"
+        ));
+
+        let reserved_name = directory.write(
+            "reserved-agent.toml",
+            &configuration("[agents.all]\nmodel = \"primary\"\nprompt = \"Explore\"\n"),
+        );
+        assert!(matches!(
+            Config::load(reserved_name),
+            Err(ConfigError::InvalidAgent { reason, .. })
+                if reason == "agent names cannot be `all`; it is reserved for the @all broadcast mention"
         ));
     }
 

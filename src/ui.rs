@@ -347,13 +347,12 @@ impl RoomUi {
     fn complete_token(&mut self) {
         if let Some((start, prefix)) = self.agent_prefix_at_cursor() {
             let lowercase = prefix.to_ascii_lowercase();
-            let candidates = self
-                .participants
-                .iter()
-                .filter(|name| name.to_ascii_lowercase().starts_with(&lowercase))
-                .map(|name| CompletionCandidate {
+            let candidates = std::iter::once(("all", "Everyone in the room"))
+                .chain(self.participants.iter().map(|name| (name.as_str(), "")))
+                .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&lowercase))
+                .map(|(name, description)| CompletionCandidate {
                     value: format!("@{name}"),
-                    description: "",
+                    description,
                 })
                 .collect::<Vec<_>>();
             self.open_completion(
@@ -947,6 +946,19 @@ mod tests {
         state.handle_event(key(KeyCode::Tab));
 
         assert_eq!(state.input, "ask @explorer ");
+        assert!(state.completion.is_none());
+    }
+
+    #[test]
+    fn tab_completes_the_all_broadcast_mention() {
+        let mut state = RoomUi::new(&room(), Vec::new());
+        for character in "@al".chars() {
+            state.handle_event(key(KeyCode::Char(character)));
+        }
+
+        state.handle_event(key(KeyCode::Tab));
+
+        assert_eq!(state.input, "@all ");
         assert!(state.completion.is_none());
     }
 

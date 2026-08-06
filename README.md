@@ -7,7 +7,8 @@
 **Tapet** is a local CLI for persistent conversations with one or more AI
 agents. Configure providers, models, agents, and reusable room templates, then
 gather agents in rooms. Messages go to the room’s default agent unless you
-select specific participants with `@agent` mentions.
+select specific participants with `@agent` mentions, or `@all` to address
+every participant at once.
 
 The name recalls the green tablecloth around which people gathered to debate
 ideas and solve problems.

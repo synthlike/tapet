@@ -6,6 +6,10 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
+/// `@all` broadcasts to every participant instead of naming one; reserved so
+/// no agent can be named `all` and become unreachable by name.
+pub const BROADCAST_MENTION: &str = "all";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoomId(Uuid);
 
@@ -211,6 +215,9 @@ impl Room {
         if mentions.is_empty() {
             return Ok(self.participants.first().into_iter().collect());
         }
+        if mentions.contains(&BROADCAST_MENTION) {
+            return Ok(self.participants.iter().collect());
+        }
 
         mentions
             .into_iter()
@@ -405,6 +412,26 @@ mod tests {
             room.route(&super::RoomMessage::user("hello @writer")),
             Err(RoomError::UnknownMention { name, .. }) if name == "writer"
         ));
+    }
+
+    #[test]
+    fn broadcasts_to_every_participant_on_at_all() {
+        let room = room();
+        let routed = room
+            .route(&super::RoomMessage::user("@all please weigh in"))
+            .unwrap();
+        let names: Vec<_> = routed.iter().map(|agent| agent.agent_name()).collect();
+        assert_eq!(names, ["explorer", "reviewer"]);
+    }
+
+    #[test]
+    fn at_all_overrides_other_mentions_in_the_same_message() {
+        let room = room();
+        let routed = room
+            .route(&super::RoomMessage::user("@explorer and @all, thoughts?"))
+            .unwrap();
+        let names: Vec<_> = routed.iter().map(|agent| agent.agent_name()).collect();
+        assert_eq!(names, ["explorer", "reviewer"]);
     }
 
     #[test]
