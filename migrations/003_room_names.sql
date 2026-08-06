@@ -1,0 +1,3 @@
+ALTER TABLE rooms ADD COLUMN name TEXT NOT NULL DEFAULT '';
+
+CREATE UNIQUE INDEX rooms_name ON rooms(name);

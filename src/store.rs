@@ -1,6 +1,6 @@
 use crate::agent::AgentSnapshot;
 use crate::config::ProviderKind;
-use crate::room::{Room, RoomId, RoomMessage};
+use crate::room::{Room, RoomId, RoomMessage, RoomName};
 use crate::stream::Completion;
 use crate::stream::ToolCall;
 use std::fs;
@@ -11,10 +11,11 @@ use time::OffsetDateTime;
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::rusqlite::{self, TransactionBehavior, params};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_RANDOM_ROOM_ATTEMPTS: usize = 64;
 const MIGRATION_001: &str = include_str!("../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_tool_calls.sql");
+const MIGRATION_003: &str = include_str!("../migrations/003_room_names.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -51,6 +52,7 @@ impl Store {
                         let transaction = connection.transaction()?;
                         transaction.execute_batch(MIGRATION_001)?;
                         transaction.execute_batch(MIGRATION_002)?;
+                        transaction.execute_batch(MIGRATION_003)?;
                         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                         transaction.commit()
                     })
@@ -61,6 +63,17 @@ impl Store {
                     .call(|connection| {
                         let transaction = connection.transaction()?;
                         transaction.execute_batch(MIGRATION_002)?;
+                        transaction.execute_batch(MIGRATION_003)?;
+                        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                        transaction.commit()
+                    })
+                    .await?;
+            }
+            2 => {
+                connection
+                    .call(|connection| {
+                        let transaction = connection.transaction()?;
+                        transaction.execute_batch(MIGRATION_003)?;
                         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                         transaction.commit()
                     })
@@ -80,22 +93,23 @@ impl Store {
 
     pub async fn create_room(
         &self,
-        requested_id: Option<RoomId>,
+        requested_name: Option<RoomName>,
         participants: Vec<AgentSnapshot>,
         description: String,
         prompt: String,
     ) -> Result<Room, StoreError> {
-        if let Some(id) = requested_id {
+        if let Some(name) = requested_name {
             return self
-                .insert_room(id, participants, description, prompt)
+                .insert_room(RoomId::new(), name, participants, description, prompt)
                 .await;
         }
 
         for _ in 0..MAX_RANDOM_ROOM_ATTEMPTS {
-            let id = RoomId::new();
+            let name = RoomName::generate();
             match self
                 .insert_room(
-                    id,
+                    RoomId::new(),
+                    name,
                     participants.clone(),
                     description.clone(),
                     prompt.clone(),
@@ -112,11 +126,13 @@ impl Store {
     async fn insert_room(
         &self,
         id: RoomId,
+        name: RoomName,
         participants: Vec<AgentSnapshot>,
         description: String,
         prompt: String,
     ) -> Result<Room, StoreError> {
         let stored_id = id.to_string();
+        let stored_name = name.to_string();
         let stored_participants = participants.clone();
         let stored_description = description.clone();
         let stored_prompt = prompt.clone();
@@ -127,8 +143,8 @@ impl Store {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let room_exists = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1)",
-                    [&stored_id],
+                    "SELECT EXISTS(SELECT 1 FROM rooms WHERE name = ?1)",
+                    [&stored_name],
                     |row| row.get::<_, bool>(0),
                 )?;
                 if room_exists {
@@ -136,9 +152,15 @@ impl Store {
                 }
                 transaction.execute(
                     "INSERT INTO rooms (
-                        id, description, system_prompt, created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?4)",
-                    params![stored_id, stored_description, stored_prompt, now],
+                        id, name, description, system_prompt, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![
+                        stored_id,
+                        stored_name,
+                        stored_description,
+                        stored_prompt,
+                        now
+                    ],
                 )?;
                 for (position, participant) in stored_participants.iter().enumerate() {
                     transaction.execute(
@@ -163,36 +185,43 @@ impl Store {
             .await
             .map_err(|error| match error {
                 tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows) => {
-                    StoreError::RoomAlreadyExists(id.to_string())
+                    StoreError::RoomAlreadyExists(name.to_string())
                 }
                 other => StoreError::Worker(other),
             })?;
 
-        Ok(Room::new(id, participants, description, prompt))
+        Ok(Room::new(id, name, participants, description, prompt))
     }
 
-    pub async fn load_room(&self, id: &RoomId) -> Result<Room, StoreError> {
-        let stored_id = id.to_string();
-        let (participants, description, prompt) = self
+    pub async fn load_room(&self, name: &RoomName) -> Result<Room, StoreError> {
+        let stored_name = name.to_string();
+        let (id, participants, description, prompt) = self
             .connection
             .call(move |connection| {
-                let (description, prompt): (String, String) = connection.query_row(
-                    "SELECT description, system_prompt FROM rooms WHERE id = ?1",
-                    [&stored_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                let (id, description, prompt): (String, String, String) = connection.query_row(
+                    "SELECT id, description, system_prompt FROM rooms WHERE name = ?1",
+                    [&stored_name],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
-                let participants = query_room_participants(connection, &stored_id)?;
-                Ok((participants, description, prompt))
+                let participants = query_room_participants(connection, &id)?;
+                Ok((id, participants, description, prompt))
             })
             .await
             .map_err(|error| match error {
                 tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows) => {
-                    StoreError::UnknownRoom(id.to_string())
+                    StoreError::UnknownRoom(name.to_string())
                 }
                 other => StoreError::Worker(other),
             })?;
+        let id: RoomId = id.parse().expect("stored room id is a valid uuid");
 
-        Ok(Room::new(id.clone(), participants, description, prompt))
+        Ok(Room::new(
+            id,
+            name.clone(),
+            participants,
+            description,
+            prompt,
+        ))
     }
 
     pub async fn room_history(&self, id: &RoomId) -> Result<Vec<RoomMessage>, StoreError> {
@@ -568,7 +597,7 @@ pub enum StoreError {
 mod tests {
     use super::{Store, StoreError};
     use crate::agent::AgentSnapshot;
-    use crate::room::{RoomId, RoomMessage};
+    use crate::room::{RoomMessage, RoomName};
     use crate::stream::Completion;
     use tempfile::TempDir;
     use tokio_rusqlite::rusqlite::{Connection, TransactionBehavior};
@@ -606,7 +635,11 @@ mod tests {
 
         let reopened = Store::open(&path).await.unwrap();
         assert_eq!(
-            reopened.load_room(room.id()).await.unwrap().participants(),
+            reopened
+                .load_room(room.name())
+                .await
+                .unwrap()
+                .participants(),
             participants
         );
         assert_eq!(
@@ -616,7 +649,7 @@ mod tests {
                 RoomMessage::agent("explorer", "Done"),
             ]
         );
-        let loaded = reopened.load_room(room.id()).await.unwrap();
+        let loaded = reopened.load_room(room.name()).await.unwrap();
         assert_eq!(loaded.description(), "Research room");
         assert_eq!(loaded.prompt(), "Cite evidence");
     }
@@ -646,23 +679,23 @@ mod tests {
         let store = Store::open(temporary.path().join("tapet.db"))
             .await
             .unwrap();
-        let id = "sweaty-warroom".parse::<RoomId>().unwrap();
+        let name = "sweaty-warroom".parse::<RoomName>().unwrap();
         let participant = AgentSnapshot::fixture("Explore");
 
         let room = store
             .create_room(
-                Some(id.clone()),
+                Some(name.clone()),
                 vec![participant.clone()],
                 String::new(),
                 String::new(),
             )
             .await
             .unwrap();
-        assert_eq!(room.id(), &id);
+        assert_eq!(room.name(), &name);
         assert!(matches!(
             store
                 .create_room(
-                    Some(id),
+                    Some(name),
                     vec![participant],
                     String::new(),
                     String::new(),
@@ -712,14 +745,14 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let path = temporary.path().join("tapet.db");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
 
         assert!(matches!(
             Store::open(path).await,
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             })
         ));
     }
@@ -750,7 +783,7 @@ mod tests {
         assert_eq!(journal_mode, "wal");
         assert!(foreign_keys);
         assert_eq!(busy_timeout, 5_000);
-        assert_eq!(user_version, 2);
+        assert_eq!(user_version, 3);
     }
 
     #[tokio::test]
@@ -779,8 +812,39 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert!(tool_calls_exists);
+    }
+
+    #[tokio::test]
+    async fn migrates_version_two_databases() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("tapet.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(super::MIGRATION_001).unwrap();
+        connection.execute_batch(super::MIGRATION_002).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        drop(connection);
+
+        let store = Store::open(path).await.unwrap();
+        let (version, name_column_exists) = store
+            .connection
+            .call(|connection| {
+                let version = connection
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+                let exists = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('rooms')
+                     WHERE name = 'name')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>((version, exists))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(version, 3);
+        assert!(name_column_exists);
     }
 
     #[tokio::test]

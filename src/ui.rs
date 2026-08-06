@@ -59,7 +59,7 @@ pub enum InputAction {
 }
 
 pub struct RoomUi {
-    room_id: String,
+    room_name: String,
     description: String,
     participants: Vec<String>,
     messages: Vec<RoomMessage>,
@@ -110,7 +110,7 @@ impl RoomUi {
             .map(|message| message.content().to_owned())
             .collect();
         Self {
-            room_id: room.id().to_string(),
+            room_name: room.name().to_string(),
             description: room.description().to_owned(),
             participants: room
                 .participants()
@@ -703,7 +703,7 @@ fn render_header(frame: &mut Frame<'_>, state: &RoomUi, area: Rect) {
     let header = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Tapet · {} ", state.room_id))
+            .title(format!(" Tapet · {} ", state.room_name))
             .title_style(
                 Style::default()
                     .fg(Color::Green)
@@ -837,7 +837,7 @@ fn render_footer(frame: &mut Frame<'_>, state: &RoomUi, area: Rect) {
 mod tests {
     use super::{InputAction, RoomUi, render};
     use crate::agent::AgentSnapshot;
-    use crate::room::{Room, RoomId, RoomMessage};
+    use crate::room::{Room, RoomId, RoomMessage, RoomName};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -845,6 +845,7 @@ mod tests {
     fn room() -> Room {
         Room::new(
             RoomId::new(),
+            RoomName::generate(),
             vec![
                 AgentSnapshot::fixture_for("explorer", "model", "Explore"),
                 AgentSnapshot::fixture_for("doubter", "model", "Doubt"),
@@ -857,6 +858,7 @@ mod tests {
     fn ambiguous_room() -> Room {
         Room::new(
             RoomId::new(),
+            RoomName::generate(),
             vec![
                 AgentSnapshot::fixture_for("explorer", "model", "Explore"),
                 AgentSnapshot::fixture_for("expert", "model", "Explain"),

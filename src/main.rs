@@ -16,7 +16,7 @@ use futures_util::{Stream, StreamExt};
 use message::Message;
 use openai::{OpenAiClient, ProviderError, ToolInput};
 use room::{
-    Room, RoomError, RoomId, RoomIdError, RoomMessage, RoomSpeaker, room_instructions,
+    Room, RoomError, RoomMessage, RoomName, RoomNameError, RoomSpeaker, room_instructions,
     validate_participants,
 };
 use std::env;
@@ -44,13 +44,13 @@ enum Command {
     },
     Room {
         source: RoomSource,
-        name: Option<RoomId>,
+        name: Option<RoomName>,
     },
     Enter {
-        room: RoomId,
+        room: RoomName,
     },
     History {
-        room: RoomId,
+        room: RoomName,
     },
 }
 
@@ -107,7 +107,7 @@ fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command,
     }
 }
 
-fn parse_room_options(arguments: &[String]) -> Result<(RoomSource, Option<RoomId>), AppError> {
+fn parse_room_options(arguments: &[String]) -> Result<(RoomSource, Option<RoomName>), AppError> {
     if arguments.is_empty() || !arguments.len().is_multiple_of(2) {
         return Err(AppError::Usage);
     }
@@ -192,41 +192,41 @@ async fn try_main() -> Result<(), AppError> {
                 .create_room(name, participants, description, prompt)
                 .await?;
             if has_interactive_terminal() {
-                let id = room.id().to_string();
+                let name = room.name().to_string();
                 run_room_ui(store, room, Vec::new()).await?;
-                println!("Room saved: {id}");
+                println!("Room saved: {name}");
             } else {
                 let input = BufReader::new(tokio::io::stdin());
                 let stdout = io::stdout();
                 let mut output = stdout.lock();
-                writeln!(output, "Starting new room: {}", room.id())?;
+                writeln!(output, "Starting new room: {}", room.name())?;
                 write_room_ready(&room, &mut output)?;
                 run_room(store, room, input, output).await?;
             }
         }
-        Command::Enter { room: id } => {
+        Command::Enter { room: name } => {
             let store = Store::open(DATABASE_PATH).await?;
-            let room = store.load_room(&id).await?;
-            let messages = store.room_history(&id).await?;
+            let room = store.load_room(&name).await?;
+            let messages = store.room_history(room.id()).await?;
             if has_interactive_terminal() {
-                let id = room.id().to_string();
+                let name = room.name().to_string();
                 run_room_ui(store, room, messages).await?;
-                println!("Room saved: {id}");
+                println!("Room saved: {name}");
             } else {
                 let input = BufReader::new(tokio::io::stdin());
                 let stdout = io::stdout();
                 let mut output = stdout.lock();
-                writeln!(output, "Room {}", room.id())?;
+                writeln!(output, "Room {}", room.name())?;
                 write_room_history(&messages, &mut output)?;
                 run_room(store, room, input, output).await?;
             }
         }
-        Command::History { room: id } => {
+        Command::History { room: name } => {
             let store = Store::open(DATABASE_PATH).await?;
             let stdout = io::stdout();
             let mut output = stdout.lock();
-            store.load_room(&id).await?;
-            let messages = store.room_history(&id).await?;
+            let room = store.load_room(&name).await?;
+            let messages = store.room_history(room.id()).await?;
             write_room_history(&messages, &mut output)?;
         }
     }
@@ -1085,7 +1085,7 @@ enum AppError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error(transparent)]
-    RoomId(#[from] RoomIdError),
+    RoomName(#[from] RoomNameError),
     #[error(transparent)]
     Room(#[from] RoomError),
     #[error("one or more room responses failed: {0}")]
@@ -1213,14 +1213,15 @@ mod tests {
             }
         );
 
-        let id = "room_550e8400e29b41d4a716446655440000";
-        let room: crate::room::RoomId = id.parse().unwrap();
+        let name = "sweaty-warroom";
+        let room: crate::room::RoomName = name.parse().unwrap();
         assert_eq!(
-            selected_command([OsString::from("enter"), OsString::from(id)].into_iter()).unwrap(),
+            selected_command([OsString::from("enter"), OsString::from(name)].into_iter()).unwrap(),
             Command::Enter { room: room.clone() }
         );
         assert_eq!(
-            selected_command([OsString::from("history"), OsString::from(id)].into_iter()).unwrap(),
+            selected_command([OsString::from("history"), OsString::from(name)].into_iter())
+                .unwrap(),
             Command::History { room }
         );
     }

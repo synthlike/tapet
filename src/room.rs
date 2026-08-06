@@ -7,10 +7,39 @@ use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RoomId(String);
+pub struct RoomId(Uuid);
 
 impl RoomId {
     pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for RoomId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl FromStr for RoomId {
+    type Err = RoomIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value)
+            .map(Self)
+            .map_err(|_| RoomIdError(value.to_owned()))
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("invalid room ID `{0}`")]
+pub struct RoomIdError(String);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoomName(String);
+
+impl RoomName {
+    pub fn generate() -> Self {
         const ADJECTIVES: &[&str] = &[
             "awkward",
             "brave",
@@ -88,25 +117,20 @@ impl RoomId {
     }
 }
 
-impl fmt::Display for RoomId {
+impl fmt::Display for RoomName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
 }
 
-impl FromStr for RoomId {
-    type Err = RoomIdError;
+impl FromStr for RoomName {
+    type Err = RoomNameError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if let Some(uuid) = value.strip_prefix("room_")
-            && let Ok(uuid) = Uuid::parse_str(uuid)
-        {
-            return Ok(Self(format!("room_{}", uuid.simple())));
-        }
         if is_valid_room_name(value) {
             Ok(Self(value.to_owned()))
         } else {
-            Err(RoomIdError(value.to_owned()))
+            Err(RoomNameError(value.to_owned()))
         }
     }
 }
@@ -124,11 +148,12 @@ fn is_valid_room_name(value: &str) -> bool {
 
 #[derive(Debug, Error)]
 #[error("invalid room name `{0}`; use 1-64 lowercase letters, numbers, and single hyphens")]
-pub struct RoomIdError(String);
+pub struct RoomNameError(String);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Room {
     id: RoomId,
+    name: RoomName,
     participants: Vec<AgentSnapshot>,
     description: String,
     prompt: String,
@@ -137,12 +162,14 @@ pub struct Room {
 impl Room {
     pub(crate) fn new(
         id: RoomId,
+        name: RoomName,
         participants: Vec<AgentSnapshot>,
         description: String,
         prompt: String,
     ) -> Self {
         Self {
             id,
+            name,
             participants,
             description,
             prompt,
@@ -151,6 +178,10 @@ impl Room {
 
     pub fn id(&self) -> &RoomId {
         &self.id
+    }
+
+    pub fn name(&self) -> &RoomName {
+        &self.name
     }
 
     pub fn participants(&self) -> &[AgentSnapshot] {
@@ -332,12 +363,13 @@ pub fn validate_participants(participants: &[AgentSnapshot]) -> Result<(), RoomE
 
 #[cfg(test)]
 mod tests {
-    use super::{Room, RoomError, RoomId, validate_participants};
+    use super::{Room, RoomError, RoomId, RoomName, validate_participants};
     use crate::agent::AgentSnapshot;
 
     fn room() -> Room {
         Room::new(
             RoomId::new(),
+            RoomName::generate(),
             vec![
                 AgentSnapshot::fixture_for("explorer", "model", "Explore"),
                 AgentSnapshot::fixture_for("reviewer", "model", "Review"),
@@ -424,21 +456,19 @@ mod tests {
     fn room_ids_round_trip() {
         let id = RoomId::new();
         assert_eq!(id.to_string().parse::<RoomId>().unwrap(), id);
-        assert!(id.to_string().contains('-'));
     }
 
     #[test]
-    fn accepts_custom_slugs_and_legacy_room_ids() {
+    fn room_names_round_trip_and_accept_custom_slugs() {
+        let generated = RoomName::generate();
         assert_eq!(
-            "sweaty-warroom".parse::<RoomId>().unwrap().to_string(),
-            "sweaty-warroom"
+            generated.to_string().parse::<RoomName>().unwrap(),
+            generated
         );
+        assert!(generated.to_string().contains('-'));
         assert_eq!(
-            "room_550e8400e29b41d4a716446655440000"
-                .parse::<RoomId>()
-                .unwrap()
-                .to_string(),
-            "room_550e8400e29b41d4a716446655440000"
+            "sweaty-warroom".parse::<RoomName>().unwrap().to_string(),
+            "sweaty-warroom"
         );
     }
 
@@ -452,7 +482,17 @@ mod tests {
             "trailing-",
             "two--dashes",
         ] {
-            assert!(name.parse::<RoomId>().is_err(), "accepted {name:?}");
+            assert!(name.parse::<RoomName>().is_err(), "accepted {name:?}");
         }
+    }
+
+    #[test]
+    fn rejects_non_uuid_room_ids() {
+        assert!("sweaty-warroom".parse::<RoomId>().is_err());
+        assert!(
+            "room_550e8400e29b41d4a716446655440000"
+                .parse::<RoomId>()
+                .is_err()
+        );
     }
 }

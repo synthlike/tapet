@@ -28,9 +28,15 @@ Or by creating "rooms" with one or more agents:
 ```sh
 tapet room --with explorer --with doubter
 tapet room --from research       # research is template defined in tapet.toml
-tapet enter room_...             # resume a room
-tapet history room_...           # print room history
+tapet room --from research --name moon-lab
+tapet enter sweaty-warroom       # resume a room
+tapet history sweaty-warroom     # print room history
 ```
+
+Without `--name`, Tapet generates a memorable adjective–place name such as
+`sweaty-warroom`, `haunted-basement`, or `caffeinated-moonbase`. Custom names
+must contain at most 64 lowercase letters, numbers, and single hyphens. Names
+must be unique within the local Tapet database.
 
 Interactive rooms support mouse-wheel scrollback, Up/Down input history, and
 Tab completion for `@agent` mentions and `/` commands.
