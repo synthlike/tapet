@@ -57,7 +57,7 @@ impl OpenAiClient {
         input: &ToolInput,
         tools_enabled: bool,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        let tools = read_file_tools();
+        let tools = available_tools();
         let request = self.build_json_request(
             instructions,
             input.items(),
@@ -182,24 +182,43 @@ struct FunctionTool {
     strict: bool,
 }
 
-fn read_file_tools() -> [FunctionTool; 1] {
-    [FunctionTool {
-        kind: "function",
-        name: "read_file",
-        description: "Read a UTF-8 text file relative to the current workspace after the user approves access.",
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Workspace-relative path of the file to read"
-                }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        }),
-        strict: true,
-    }]
+fn available_tools() -> [FunctionTool; 2] {
+    [
+        FunctionTool {
+            kind: "function",
+            name: "read_file",
+            description: "Read a UTF-8 text file relative to the current workspace after the user approves access.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative path of the file to read"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            strict: true,
+        },
+        FunctionTool {
+            kind: "function",
+            name: "list_files",
+            description: "List the immediate entries of a workspace-relative directory after the user approves access.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative directory to list"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            strict: true,
+        },
+    ]
 }
 
 #[derive(Debug, Deserialize)]
@@ -470,8 +489,8 @@ pub enum ProviderError {
 mod tests {
     use super::{
         BoundedBodyBuffer, CreateResponseRequest, MAX_ERROR_BODY_BYTES, OpenAiClient,
-        ProviderError, STATELESS_REASONING_INCLUDE, ToolInput, decode_stream, read_api_key,
-        read_file_tools,
+        ProviderError, STATELESS_REASONING_INCLUDE, ToolInput, available_tools, decode_stream,
+        read_api_key,
     };
     use crate::message::Message;
     use crate::stream::{Completion, ResponseRound, StreamEvent, ToolCall};
@@ -680,7 +699,7 @@ mod tests {
             "test-secret".to_owned(),
             "test-model",
         );
-        let tools = read_file_tools();
+        let tools = available_tools();
         let input = ToolInput::from_messages(&[Message::user("Inspect Cargo.toml")]).unwrap();
         let request = client
             .build_json_request(
@@ -703,6 +722,10 @@ mod tests {
             body["tools"][0]["parameters"]["additionalProperties"],
             false
         );
+        assert_eq!(body["tools"][1]["type"], "function");
+        assert_eq!(body["tools"][1]["name"], "list_files");
+        assert_eq!(body["tools"][1]["strict"], true);
+        assert_eq!(body["tools"][1]["parameters"]["required"], json!(["path"]));
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     }
 

@@ -86,6 +86,7 @@ struct LiveResponse {
 
 struct ToolApproval {
     agent: String,
+    verb: &'static str,
     path: String,
 }
 
@@ -190,9 +191,10 @@ impl RoomUi {
         self.follow_output = true;
     }
 
-    pub fn request_tool_approval(&mut self, agent: &str, path: &str) {
+    pub fn request_tool_approval(&mut self, agent: &str, verb: &'static str, path: &str) {
         self.tool_approval = Some(ToolApproval {
             agent: agent.to_owned(),
+            verb,
             path: path.to_owned(),
         });
         self.set_status("Tool approval required");
@@ -602,20 +604,21 @@ fn render_tool_approval(frame: &mut Frame<'_>, state: &RoomUi) {
         width,
         height,
     );
+    let caution = match approval.verb {
+        "list" => "The directory listing will be sent to the model.",
+        _ => "The file contents will be sent to the model.",
+    };
     let content = vec![
         Line::from(vec![
             Span::styled(
                 format!("@{}", approval.agent),
                 Style::default().fg(Color::Magenta),
             ),
-            Span::raw(" wants to read "),
+            Span::raw(format!(" wants to {} ", approval.verb)),
             Span::styled(&approval.path, Style::default().fg(Color::Cyan)),
         ]),
         Line::default(),
-        Line::styled(
-            "The file contents will be sent to the model.",
-            Style::default().fg(Color::Yellow),
-        ),
+        Line::styled(caution, Style::default().fg(Color::Yellow)),
         Line::default(),
         Line::from(vec![
             Span::styled("[y] Allow once", Style::default().fg(Color::Green)),
@@ -628,7 +631,7 @@ fn render_tool_approval(frame: &mut Frame<'_>, state: &RoomUi) {
         Paragraph::new(content).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" read_file approval ")
+                .title(format!(" {} approval ", approval.verb))
                 .border_style(Style::default().fg(Color::Yellow)),
         ),
         area,

@@ -29,7 +29,7 @@ use stream::{Completion, ResponseRound, StreamEvent, ToolCall};
 use terminal::InputSuppression;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
-use tool::{MAX_TOOL_CALLS_PER_TURN, ReadFileRequest, error_output};
+use tool::{MAX_TOOL_CALLS_PER_TURN, ToolRequest, error_output};
 use ui::{InputAction, RoomUi, TerminalUi};
 
 const CONFIG_PATH: &str = "tapet.toml";
@@ -481,8 +481,7 @@ async fn stream_room_response_ui(
                 continue;
             }
             tool_calls += 1;
-            let Some(output) = run_read_file_ui(agent_name, &call, record_id, store, ui).await?
-            else {
+            let Some(output) = run_tool_ui(agent_name, &call, record_id, store, ui).await? else {
                 return Ok(None);
             };
             input.append_function_output(&call.call_id, output);
@@ -546,30 +545,25 @@ where
     }
 }
 
-async fn run_read_file_ui(
+async fn run_tool_ui(
     agent_name: &str,
     call: &ToolCall,
     record_id: i64,
     store: &Store,
     ui: &mut ActiveRoomUi<'_>,
 ) -> Result<Option<String>, AppError> {
-    if call.name != "read_file" {
-        let error = format!("unknown tool `{}`", call.name);
-        store.fail_tool_call(record_id, error.clone()).await?;
-        ui.state
-            .push_tool_notice(format!("✗ {} · {error}", call.name));
-        return Ok(Some(error_output(&error)));
-    }
-    let request = match ReadFileRequest::parse(&call.arguments) {
+    let request = match ToolRequest::parse(&call.name, &call.arguments) {
         Ok(request) => request,
         Err(error) => {
             store.fail_tool_call(record_id, error.to_string()).await?;
-            ui.state.push_tool_notice(format!("✗ read_file · {error}"));
+            ui.state
+                .push_tool_notice(format!("✗ {} · {error}", call.name));
             return Ok(Some(error_output(&error)));
         }
     };
+    let verb = request.verb();
     let path = request.display_path();
-    ui.state.request_tool_approval(agent_name, &path);
+    ui.state.request_tool_approval(agent_name, verb, &path);
     ui.terminal.draw(ui.state)?;
 
     let approved = loop {
@@ -605,7 +599,7 @@ async fn run_read_file_ui(
     if !approved {
         store.deny_tool_call(record_id).await?;
         ui.state
-            .push_tool_notice(format!("○ @{agent_name} read {path} · denied"));
+            .push_tool_notice(format!("○ @{agent_name} {verb} {path} · denied"));
         ui.terminal.draw(ui.state)?;
         return Ok(Some(error_output(&"user denied file access")));
     }
@@ -613,9 +607,10 @@ async fn run_read_file_ui(
     store.approve_tool_call(record_id).await?;
     store.start_tool_call(record_id).await?;
     ui.state
-        .set_status(format!("@{agent_name} is reading {path}..."));
+        .set_status(format!("@{agent_name} is {verb}ing {path}..."));
     ui.terminal.draw(ui.state)?;
     let workspace = env::current_dir()?;
+    let request_for_label = request.clone();
     let task = tokio::task::spawn_blocking(move || request.execute(&workspace));
     tokio::pin!(task);
     let result = loop {
@@ -640,23 +635,23 @@ async fn run_read_file_ui(
     };
 
     match result {
-        Ok(output) => {
+        Ok(outcome) => {
             store
-                .complete_tool_call(record_id, output.bytes, output.lines)
+                .complete_tool_call(record_id, outcome.bytes, outcome.lines)
                 .await?;
             ui.state.push_tool_notice(format!(
-                "✓ @{agent_name} read {} · {} lines · {}",
-                output.path,
-                output.lines,
-                format_bytes(output.bytes)
+                "✓ @{agent_name} {verb} {path} · {} {} · {}",
+                outcome.lines,
+                request_for_label.count_label(outcome.lines),
+                format_bytes(outcome.bytes)
             ));
             ui.terminal.draw(ui.state)?;
-            Ok(Some(serde_json::to_string(&output)?))
+            Ok(Some(outcome.json))
         }
         Err(error) => {
             store.fail_tool_call(record_id, error.to_string()).await?;
             ui.state
-                .push_tool_notice(format!("✗ @{agent_name} read {path} · {error}"));
+                .push_tool_notice(format!("✗ @{agent_name} {verb} {path} · {error}"));
             ui.terminal.draw(ui.state)?;
             Ok(Some(error_output(&error)))
         }
