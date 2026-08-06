@@ -224,6 +224,68 @@ impl Store {
         ))
     }
 
+    pub async fn add_room_participant(
+        &self,
+        room_id: &RoomId,
+        participant: AgentSnapshot,
+    ) -> Result<(), StoreError> {
+        let stored_id = room_id.to_string();
+        let agent_name = participant.agent_name().to_owned();
+        let now = now_millis();
+
+        self.connection
+            .call(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let exists = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM room_participants WHERE room_id = ?1 AND agent_name = ?2
+                     )",
+                    params![stored_id, participant.agent_name()],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if exists {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+                let next_position: i64 = transaction.query_row(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM room_participants
+                     WHERE room_id = ?1",
+                    [&stored_id],
+                    |row| row.get(0),
+                )?;
+                transaction.execute(
+                    "INSERT INTO room_participants (
+                        room_id, agent_name, provider_kind, base_url, api_key_env,
+                        model, system_prompt, position
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        stored_id,
+                        participant.agent_name(),
+                        participant.provider_kind().as_str(),
+                        participant.base_url(),
+                        participant.api_key_env(),
+                        participant.model(),
+                        participant.system_prompt(),
+                        next_position,
+                    ],
+                )?;
+                transaction.execute(
+                    "UPDATE rooms SET updated_at = ?2 WHERE id = ?1",
+                    params![stored_id, now],
+                )?;
+                transaction.commit()
+            })
+            .await
+            .map_err(|error| match error {
+                tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows) => {
+                    StoreError::ParticipantAlreadyExists(agent_name)
+                }
+                other => StoreError::Worker(other),
+            })?;
+
+        Ok(())
+    }
+
     pub async fn room_history(&self, id: &RoomId) -> Result<Vec<RoomMessage>, StoreError> {
         let stored_id = id.to_string();
         Ok(self
@@ -589,6 +651,8 @@ pub enum StoreError {
     RoomAlreadyExists(String),
     #[error("could not generate an unused random room name")]
     RandomRoomNameExhausted,
+    #[error("`@{0}` is already in this room")]
+    ParticipantAlreadyExists(String),
     #[error("token count {0} cannot be stored")]
     TokenCountOutOfRange(u64),
 }
@@ -702,6 +766,33 @@ mod tests {
                 )
                 .await,
             Err(StoreError::RoomAlreadyExists(name)) if name == "sweaty-warroom"
+        ));
+    }
+
+    #[tokio::test]
+    async fn adds_a_participant_and_rejects_duplicates() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("tapet.db");
+        let store = Store::open(&path).await.unwrap();
+        let explorer = AgentSnapshot::fixture_for("explorer", "fast-model", "Explore");
+        let doubter = AgentSnapshot::fixture_for("doubter", "fast-model", "Doubt");
+        let room = store
+            .create_room(None, vec![explorer.clone()], String::new(), String::new())
+            .await
+            .unwrap();
+
+        store
+            .add_room_participant(room.id(), doubter.clone())
+            .await
+            .unwrap();
+
+        let reopened = Store::open(&path).await.unwrap();
+        let loaded = reopened.load_room(room.name()).await.unwrap();
+        assert_eq!(loaded.participants(), [explorer, doubter.clone()]);
+
+        assert!(matches!(
+            store.add_room_participant(room.id(), doubter).await,
+            Err(StoreError::ParticipantAlreadyExists(name)) if name == "doubter"
         ));
     }
 

@@ -12,7 +12,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::io;
 
-const COMMANDS: [(&str, &str); 3] = [
+const COMMANDS: [(&str, &str); 4] = [
+    ("/add", "Add an agent to the room"),
     ("/agents", "Show room participants"),
     ("/exit", "Leave the room"),
     ("/help", "Show room commands"),
@@ -57,6 +58,7 @@ pub enum InputAction {
     None,
     Submit(String),
     Exit,
+    AddAgent(String),
 }
 
 pub struct RoomUi {
@@ -209,6 +211,10 @@ impl RoomUi {
         self.follow_output = true;
     }
 
+    pub fn add_known_participant(&mut self, name: &str) {
+        self.participants.push(name.to_owned());
+    }
+
     pub fn finish_response(&mut self, agent: &str, content: String) {
         self.live_response = None;
         self.messages.push(RoomMessage::agent(agent, content));
@@ -297,7 +303,7 @@ impl RoomUi {
                     "" => InputAction::None,
                     "/exit" => InputAction::Exit,
                     "/help" => {
-                        self.set_status("Commands: /agents · /help · /exit");
+                        self.set_status("Commands: /add <agent> · /agents · /help · /exit");
                         InputAction::None
                     }
                     "/agents" => {
@@ -310,6 +316,15 @@ impl RoomUi {
                                 .join(", ")
                         ));
                         InputAction::None
+                    }
+                    command if command == "/add" || command.starts_with("/add ") => {
+                        let name = command["/add".len()..].trim();
+                        if name.is_empty() {
+                            self.set_error("usage: /add <agent>");
+                            InputAction::None
+                        } else {
+                            InputAction::AddAgent(name.to_owned())
+                        }
                     }
                     command if command.starts_with('/') => {
                         self.set_error(format!(
@@ -1063,7 +1078,7 @@ mod tests {
     #[test]
     fn slash_commands_complete_and_run_locally() {
         let mut state = RoomUi::new(&room(), Vec::new());
-        for character in "/a".chars() {
+        for character in "/ag".chars() {
             state.handle_event(key(KeyCode::Char(character)));
         }
         state.handle_event(key(KeyCode::Tab));
@@ -1074,11 +1089,44 @@ mod tests {
 
         state.handle_event(key(KeyCode::Char('/')));
         state.handle_event(key(KeyCode::Tab));
-        assert_eq!(state.completion.as_ref().unwrap().candidates.len(), 3);
+        assert_eq!(state.completion.as_ref().unwrap().candidates.len(), 4);
         assert_eq!(
             state.completion.as_ref().unwrap().title,
             " Complete /command "
         );
+    }
+
+    #[test]
+    fn add_command_joins_a_new_agent_to_the_room() {
+        let mut state = RoomUi::new(&room(), Vec::new());
+        for character in "/add synthesizer".chars() {
+            state.handle_event(key(KeyCode::Char(character)));
+        }
+        assert_eq!(
+            state.handle_event(key(KeyCode::Enter)),
+            InputAction::AddAgent("synthesizer".to_owned())
+        );
+
+        state.add_known_participant("synthesizer");
+        for character in "/agents".chars() {
+            state.handle_event(key(KeyCode::Char(character)));
+        }
+        state.handle_event(key(KeyCode::Enter));
+        assert_eq!(
+            state.status,
+            "Participants: @explorer, @doubter, @synthesizer"
+        );
+    }
+
+    #[test]
+    fn add_command_without_an_agent_name_is_a_usage_error() {
+        let mut state = RoomUi::new(&room(), Vec::new());
+        for character in "/add".chars() {
+            state.handle_event(key(KeyCode::Char(character)));
+        }
+        assert_eq!(state.handle_event(key(KeyCode::Enter)), InputAction::None);
+        assert_eq!(state.status, "usage: /add <agent>");
+        assert!(state.status_is_error);
     }
 
     fn mouse(kind: MouseEventKind) -> Event {

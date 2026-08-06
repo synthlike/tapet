@@ -279,7 +279,11 @@ fn write_room_history(messages: &[RoomMessage], output: &mut impl Write) -> io::
     Ok(())
 }
 
-async fn run_room_ui(store: Store, room: Room, messages: Vec<RoomMessage>) -> Result<(), AppError> {
+async fn run_room_ui(
+    store: Store,
+    mut room: Room,
+    messages: Vec<RoomMessage>,
+) -> Result<(), AppError> {
     let mut terminal = TerminalUi::start()?;
     let mut terminal_events = EventStream::new();
     let mut state = RoomUi::new(&room, messages);
@@ -304,8 +308,51 @@ async fn run_room_ui(store: Store, room: Room, messages: Vec<RoomMessage>) -> Re
                     return Ok(());
                 }
             }
+            InputAction::AddAgent(name) => {
+                add_room_participant_ui(&store, &mut room, &name, &mut state).await?;
+            }
         }
     }
+}
+
+async fn add_room_participant_ui(
+    store: &Store,
+    room: &mut Room,
+    agent_name: &str,
+    state: &mut RoomUi,
+) -> Result<(), AppError> {
+    if room.participant(agent_name).is_some() {
+        state.set_error(format!("@{agent_name} is already in this room"));
+        return Ok(());
+    }
+    let config = match Config::load(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(error) => {
+            state.set_error(error.to_string());
+            return Ok(());
+        }
+    };
+    let agent = match config.agent(agent_name) {
+        Ok(agent) => agent,
+        Err(error) => {
+            state.set_error(error.to_string());
+            return Ok(());
+        }
+    };
+    let participant = AgentSnapshot::resolve(agent);
+
+    match store
+        .add_room_participant(room.id(), participant.clone())
+        .await
+    {
+        Ok(()) => {
+            room.add_participant(participant);
+            state.add_known_participant(agent_name);
+            state.set_status(format!("@{agent_name} joined the room"));
+        }
+        Err(error) => state.set_error(error.to_string()),
+    }
+    Ok(())
 }
 
 async fn run_room_ui_turn(

@@ -206,6 +206,10 @@ impl Room {
             .find(|participant| participant.agent_name() == name)
     }
 
+    pub(crate) fn add_participant(&mut self, participant: AgentSnapshot) {
+        self.participants.push(participant);
+    }
+
     pub fn route(&self, message: &RoomMessage) -> Result<Vec<&AgentSnapshot>, RoomError> {
         if matches!(message.speaker(), RoomSpeaker::Agent(_)) {
             return Ok(Vec::new());

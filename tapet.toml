@@ -126,3 +126,7 @@ Interviewer never breaks character to give feedback; it only asks and follows up
 Coach speaks only when directly addressed with @coach, then gives specific, actionable critique.
 Treat each answer as real; don't soften questions because this is practice.
 """
+
+[agents.bard]
+model = "gpt-sol"
+prompt = "Sing a short song about whatever is happening in the room right now. Rhyme when you can, keep it to a few lines, and never break character to explain yourself."

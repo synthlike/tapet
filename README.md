@@ -30,8 +30,10 @@ tapet history moon-lab                          # print room history
 ```
 
 Rooms default to their first (or default) agent; address others with
-`@agent`, or `@all` to broadcast. Interactive rooms support scrollback,
-input history, and Tab completion for `@agent` mentions and `/` commands.
+`@agent`, or `@all` to broadcast. Interactive rooms support scrollback, input
+history, Tab completion for `@agent` mentions and `/` commands, and slash
+commands (`/agents`, `/add <agent>`, `/help`, `/exit`) to manage the room
+without leaving it.
 
 Agents may also request the `read_file`, `list_files`, and `write_file` tools
 to inspect or change the workspace — `write_file` shows a diff to approve
