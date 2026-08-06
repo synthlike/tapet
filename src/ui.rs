@@ -7,7 +7,7 @@ use crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::io;
 
@@ -70,6 +70,7 @@ pub struct RoomUi {
     history_draft: String,
     completion: Option<CompletionMenu>,
     live_response: Option<LiveResponse>,
+    tool_approval: Option<ToolApproval>,
     status: String,
     status_is_error: bool,
     scroll: u16,
@@ -81,6 +82,11 @@ pub struct RoomUi {
 struct LiveResponse {
     agent: String,
     content: String,
+}
+
+struct ToolApproval {
+    agent: String,
+    path: String,
 }
 
 struct CompletionMenu {
@@ -119,6 +125,7 @@ impl RoomUi {
             history_draft: String::new(),
             completion: None,
             live_response: None,
+            tool_approval: None,
             status: "Ready".to_owned(),
             status_is_error: false,
             scroll: 0,
@@ -173,6 +180,31 @@ impl RoomUi {
         if let Some(response) = &mut self.live_response {
             response.content.push_str(delta);
         }
+        self.follow_output = true;
+    }
+
+    pub fn reset_response_content(&mut self) {
+        if let Some(response) = &mut self.live_response {
+            response.content.clear();
+        }
+        self.follow_output = true;
+    }
+
+    pub fn request_tool_approval(&mut self, agent: &str, path: &str) {
+        self.tool_approval = Some(ToolApproval {
+            agent: agent.to_owned(),
+            path: path.to_owned(),
+        });
+        self.set_status("Tool approval required");
+    }
+
+    pub fn clear_tool_approval(&mut self) {
+        self.tool_approval = None;
+    }
+
+    pub fn push_tool_notice(&mut self, notice: impl Into<String>) {
+        self.messages
+            .push(RoomMessage::agent("tapet", notice.into()));
         self.follow_output = true;
     }
 
@@ -551,6 +583,56 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &mut RoomUi) {
     render_completion(frame, state, completion_area);
     render_input(frame, state, input_area);
     render_footer(frame, state, footer_area);
+    render_tool_approval(frame, state);
+}
+
+fn render_tool_approval(frame: &mut Frame<'_>, state: &RoomUi) {
+    let Some(approval) = &state.tool_approval else {
+        return;
+    };
+    let frame_area = frame.area();
+    let width = frame_area.width.saturating_sub(4).min(72);
+    if width < 20 || frame_area.height < 5 {
+        return;
+    }
+    let height = 7.min(frame_area.height);
+    let area = Rect::new(
+        frame_area.x + frame_area.width.saturating_sub(width) / 2,
+        frame_area.y + frame_area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let content = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("@{}", approval.agent),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::raw(" wants to read "),
+            Span::styled(&approval.path, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::default(),
+        Line::styled(
+            "The file contents will be sent to the model.",
+            Style::default().fg(Color::Yellow),
+        ),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("[y] Allow once", Style::default().fg(Color::Green)),
+            Span::raw("    "),
+            Span::styled("[n] Deny", Style::default().fg(Color::Red)),
+        ]),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(content).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" read_file approval ")
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        area,
+    );
 }
 
 fn render_completion(frame: &mut Frame<'_>, state: &RoomUi, area: Rect) {
@@ -727,7 +809,9 @@ fn render_input(frame: &mut Frame<'_>, state: &RoomUi, area: Rect) {
         .saturating_add(content_cursor)
         .saturating_sub(horizontal_scroll)
         .min(inner.right().saturating_sub(1));
-    frame.set_cursor_position((cursor_x, inner.y));
+    if state.tool_approval.is_none() {
+        frame.set_cursor_position((cursor_x, inner.y));
+    }
 }
 
 fn render_footer(frame: &mut Frame<'_>, state: &RoomUi, area: Rect) {
@@ -736,13 +820,15 @@ fn render_footer(frame: &mut Frame<'_>, state: &RoomUi, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    let controls = if state.tool_approval.is_some() {
+        "y allow once · n deny · Mouse wheel scroll · Ctrl-C cancel"
+    } else {
+        "Tab complete · Enter send · Mouse wheel scroll · Ctrl-C exit"
+    };
     let footer = Line::from(vec![
         Span::styled(state.status.as_str(), status_style),
         Span::raw("  "),
-        Span::styled(
-            "Tab complete · Enter send · Mouse wheel scroll · Ctrl-C exit",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(controls, Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(footer), area);
 }

@@ -2,6 +2,7 @@ use crate::agent::AgentSnapshot;
 use crate::config::ProviderKind;
 use crate::room::{Room, RoomId, RoomMessage};
 use crate::stream::Completion;
+use crate::stream::ToolCall;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -10,8 +11,9 @@ use time::OffsetDateTime;
 use tokio_rusqlite::Connection;
 use tokio_rusqlite::rusqlite::{self, TransactionBehavior, params};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MIGRATION_001: &str = include_str!("../migrations/001_initial.sql");
+const MIGRATION_002: &str = include_str!("../migrations/002_tool_calls.sql");
 
 #[derive(Clone)]
 pub struct Store {
@@ -41,21 +43,35 @@ impl Store {
             })
             .await?;
 
-        if version != 0 && version != SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedSchemaVersion {
-                found: version,
-                supported: SCHEMA_VERSION,
-            });
-        }
-        if version == 0 {
-            connection
-                .call(|connection| {
-                    let transaction = connection.transaction()?;
-                    transaction.execute_batch(MIGRATION_001)?;
-                    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                    transaction.commit()
-                })
-                .await?;
+        match version {
+            0 => {
+                connection
+                    .call(|connection| {
+                        let transaction = connection.transaction()?;
+                        transaction.execute_batch(MIGRATION_001)?;
+                        transaction.execute_batch(MIGRATION_002)?;
+                        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                        transaction.commit()
+                    })
+                    .await?;
+            }
+            1 => {
+                connection
+                    .call(|connection| {
+                        let transaction = connection.transaction()?;
+                        transaction.execute_batch(MIGRATION_002)?;
+                        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                        transaction.commit()
+                    })
+                    .await?;
+            }
+            SCHEMA_VERSION => {}
+            found => {
+                return Err(StoreError::UnsupportedSchemaVersion {
+                    found,
+                    supported: SCHEMA_VERSION,
+                });
+            }
         }
 
         Ok(Self { connection })
@@ -297,6 +313,117 @@ impl Store {
             .await?;
         Ok(())
     }
+
+    pub(crate) async fn record_tool_proposal(
+        &self,
+        room_call_id: i64,
+        call: &ToolCall,
+    ) -> Result<i64, StoreError> {
+        let provider_call_id = call.call_id.clone();
+        let tool_name = call.name.clone();
+        let arguments = call.arguments.clone();
+        let now = now_millis();
+        Ok(self
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO tool_calls (
+                        room_call_id, provider_call_id, tool_name, arguments,
+                        status, proposed_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'proposed', ?5)",
+                    params![room_call_id, provider_call_id, tool_name, arguments, now],
+                )?;
+                Ok(connection.last_insert_rowid())
+            })
+            .await?)
+    }
+
+    pub(crate) async fn approve_tool_call(&self, tool_call_id: i64) -> Result<(), StoreError> {
+        self.transition_tool_call(
+            tool_call_id,
+            "UPDATE tool_calls SET status = 'approved', decided_at = ?2
+             WHERE id = ?1 AND status = 'proposed'",
+            now_millis(),
+        )
+        .await
+    }
+
+    pub(crate) async fn deny_tool_call(&self, tool_call_id: i64) -> Result<(), StoreError> {
+        self.transition_tool_call(
+            tool_call_id,
+            "UPDATE tool_calls SET status = 'denied', decided_at = ?2, finished_at = ?2
+             WHERE id = ?1 AND status = 'proposed'",
+            now_millis(),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_tool_call(&self, tool_call_id: i64) -> Result<(), StoreError> {
+        self.transition_tool_call(
+            tool_call_id,
+            "UPDATE tool_calls SET status = 'running', started_at = ?2
+             WHERE id = ?1 AND status = 'approved'",
+            now_millis(),
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_tool_call(
+        &self,
+        tool_call_id: i64,
+        bytes: u64,
+        lines: u64,
+    ) -> Result<(), StoreError> {
+        let bytes = token_count(bytes)?;
+        let lines = token_count(lines)?;
+        let now = now_millis();
+        self.connection
+            .call(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE tool_calls SET status = 'completed', result_bytes = ?2,
+                        result_lines = ?3, finished_at = ?4
+                     WHERE id = ?1 AND status = 'running'",
+                    params![tool_call_id, bytes, lines, now],
+                )?;
+                require_transition(changed)
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn fail_tool_call(
+        &self,
+        tool_call_id: i64,
+        error: String,
+    ) -> Result<(), StoreError> {
+        let now = now_millis();
+        self.connection
+            .call(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE tool_calls SET status = 'failed', error = ?2, finished_at = ?3
+                     WHERE id = ?1 AND status IN ('proposed', 'approved', 'running')",
+                    params![tool_call_id, error, now],
+                )?;
+                require_transition(changed)
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn transition_tool_call(
+        &self,
+        tool_call_id: i64,
+        statement: &'static str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .call(move |connection| {
+                let changed = connection.execute(statement, params![tool_call_id, now])?;
+                require_transition(changed)
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 pub(crate) struct AppendedRoomMessage {
@@ -358,6 +485,14 @@ fn now_millis() -> i64 {
 
 fn token_count(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::TokenCountOutOfRange(value))
+}
+
+fn require_transition(changed: usize) -> rusqlite::Result<()> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::InvalidQuery)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -488,14 +623,14 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let path = temporary.path().join("tapet.db");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
         drop(connection);
 
         assert!(matches!(
             Store::open(path).await,
             Err(StoreError::UnsupportedSchemaVersion {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             })
         ));
     }
@@ -526,7 +661,97 @@ mod tests {
         assert_eq!(journal_mode, "wal");
         assert!(foreign_keys);
         assert_eq!(busy_timeout, 5_000);
-        assert_eq!(user_version, 1);
+        assert_eq!(user_version, 2);
+    }
+
+    #[tokio::test]
+    async fn migrates_version_one_databases() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("tapet.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(super::MIGRATION_001).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        drop(connection);
+
+        let store = Store::open(path).await.unwrap();
+        let (version, tool_calls_exists) = store
+            .connection
+            .call(|connection| {
+                let version = connection
+                    .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+                let exists = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'tool_calls')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>((version, exists))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(version, 2);
+        assert!(tool_calls_exists);
+    }
+
+    #[tokio::test]
+    async fn persists_tool_lifecycle_metadata_without_results() {
+        let temporary = TempDir::new().unwrap();
+        let store = Store::open(temporary.path().join("tapet.db"))
+            .await
+            .unwrap();
+        let room = store
+            .create_room(
+                vec![AgentSnapshot::fixture("Explore")],
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let message = store
+            .append_room_user_message(room.id(), "read it".to_owned())
+            .await
+            .unwrap();
+        let room_call = store
+            .begin_room_call(room.id(), "explorer", message.message_id)
+            .await
+            .unwrap();
+        let tool_call = store
+            .record_tool_proposal(
+                room_call,
+                &crate::stream::ToolCall {
+                    call_id: "call_1".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{\"path\":\"src/main.rs\"}".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        store.approve_tool_call(tool_call).await.unwrap();
+        store.start_tool_call(tool_call).await.unwrap();
+        store.complete_tool_call(tool_call, 2048, 64).await.unwrap();
+
+        let row = store
+            .connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT status, result_bytes, result_lines, error
+                     FROM tool_calls WHERE id = ?1",
+                    [tool_call],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(row, ("completed".to_owned(), 2048, 64, None));
     }
 
     fn completion() -> Completion {

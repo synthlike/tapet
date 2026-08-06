@@ -1,6 +1,6 @@
 use crate::config::Agent;
 use crate::message::Message;
-use crate::stream::{Completion, StreamEvent, ToolCall};
+use crate::stream::{Completion, ResponseRound, StreamEvent, ToolCall};
 use eventsource_stream::{Event, Eventsource};
 use futures_util::stream::{BoxStream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use std::fmt;
 use thiserror::Error;
 
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const STATELESS_REASONING_INCLUDE: [&str; 1] = ["reasoning.encrypted_content"];
 
 pub struct OpenAiClient {
     http: reqwest::Client,
@@ -50,13 +51,19 @@ impl OpenAiClient {
         self.execute_stream(request).await
     }
 
-    pub async fn stream_with_tool_proposals(
+    pub async fn stream_with_tools(
         &self,
         instructions: &str,
-        messages: &[Message],
+        input: &ToolInput,
+        tools_enabled: bool,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        let tools = proposal_tools();
-        let request = self.build_request_with_tools(instructions, messages, &tools)?;
+        let tools = read_file_tools();
+        let request = self.build_json_request(
+            instructions,
+            input.items(),
+            if tools_enabled { tools.as_slice() } else { &[] },
+            Some(&STATELESS_REASONING_INCLUDE),
+        )?;
         self.execute_stream(request).await
     }
 
@@ -83,22 +90,25 @@ impl OpenAiClient {
         instructions: &str,
         messages: &[Message],
     ) -> Result<reqwest::Request, ProviderError> {
-        self.build_request_with_tools(instructions, messages, &[])
+        let input = serde_json::to_value(messages)?;
+        self.build_json_request(instructions, input, &[], None)
     }
 
-    fn build_request_with_tools(
+    fn build_json_request(
         &self,
         instructions: &str,
-        messages: &[Message],
+        input: Value,
         tools: &[FunctionTool],
+        include: Option<&[&str]>,
     ) -> Result<reqwest::Request, ProviderError> {
         let request = CreateResponseRequest {
             model: &self.model,
             instructions,
-            input: messages,
+            input,
             store: false,
             stream: true,
             tools,
+            include,
         };
 
         Ok(self
@@ -123,11 +133,43 @@ fn read_api_key(name: &str) -> Result<String, ProviderError> {
 struct CreateResponseRequest<'a> {
     model: &'a str,
     instructions: &'a str,
-    input: &'a [Message],
+    input: Value,
     store: bool,
     stream: bool,
     #[serde(skip_serializing_if = "<[FunctionTool]>::is_empty")]
     tools: &'a [FunctionTool],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include: Option<&'a [&'a str]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolInput {
+    items: Vec<Value>,
+}
+
+impl ToolInput {
+    pub fn from_messages(messages: &[Message]) -> Result<Self, ProviderError> {
+        let Value::Array(items) = serde_json::to_value(messages)? else {
+            unreachable!("a message slice serializes as a JSON array");
+        };
+        Ok(Self { items })
+    }
+
+    pub fn append_output_items(&mut self, output_items: Vec<Value>) {
+        self.items.extend(output_items);
+    }
+
+    pub fn append_function_output(&mut self, call_id: &str, output: String) {
+        self.items.push(json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        }));
+    }
+
+    fn items(&self) -> Value {
+        Value::Array(self.items.clone())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -140,11 +182,11 @@ struct FunctionTool {
     strict: bool,
 }
 
-fn proposal_tools() -> [FunctionTool; 1] {
+fn read_file_tools() -> [FunctionTool; 1] {
     [FunctionTool {
         kind: "function",
         name: "read_file",
-        description: "Propose reading a UTF-8 text file relative to the current workspace.",
+        description: "Read a UTF-8 text file relative to the current workspace after the user approves access.",
         parameters: json!({
             "type": "object",
             "properties": {
@@ -205,6 +247,8 @@ struct CompletedResponse {
     id: Option<String>,
     status: String,
     usage: Usage,
+    #[serde(default)]
+    output: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,10 +326,13 @@ fn decode_event(event: &Event) -> Result<Option<StreamEvent>, ProviderError> {
                     event.response.status,
                 ));
             }
-            Ok(Some(StreamEvent::Completed(Completion {
-                provider_response_id: event.response.id,
-                input_tokens: event.response.usage.input_tokens,
-                output_tokens: event.response.usage.output_tokens,
+            Ok(Some(StreamEvent::Completed(ResponseRound {
+                completion: Completion {
+                    provider_response_id: event.response.id,
+                    input_tokens: event.response.usage.input_tokens,
+                    output_tokens: event.response.usage.output_tokens,
+                },
+                output_items: event.response.output,
             })))
         }
         "error" => {
@@ -394,6 +441,8 @@ pub enum ProviderError {
     MissingApiKey { name: String },
     #[error("OpenAI request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("could not serialize an OpenAI request: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("OpenAI API returned HTTP {status}: {body}")]
     Api { status: u16, body: BoundedBody },
     #[error("OpenAI stream protocol failed: {0}")]
@@ -421,10 +470,11 @@ pub enum ProviderError {
 mod tests {
     use super::{
         BoundedBodyBuffer, CreateResponseRequest, MAX_ERROR_BODY_BYTES, OpenAiClient,
-        ProviderError, decode_stream, proposal_tools, read_api_key,
+        ProviderError, STATELESS_REASONING_INCLUDE, ToolInput, decode_stream, read_api_key,
+        read_file_tools,
     };
     use crate::message::Message;
-    use crate::stream::{Completion, StreamEvent, ToolCall};
+    use crate::stream::{Completion, ResponseRound, StreamEvent, ToolCall};
     use futures_util::{Stream, StreamExt, stream};
     use reqwest::header::AUTHORIZATION;
     use serde_json::json;
@@ -442,10 +492,11 @@ mod tests {
         let request = CreateResponseRequest {
             model: "test-model",
             instructions: "Be concise",
-            input: &messages,
+            input: serde_json::to_value(&messages).unwrap(),
             store: false,
             stream: true,
             tools: &[],
+            include: None,
         };
 
         assert_eq!(
@@ -484,10 +535,13 @@ mod tests {
             [
                 StreamEvent::TextDelta("Owner".to_owned()),
                 StreamEvent::TextDelta("ship".to_owned()),
-                StreamEvent::Completed(Completion {
-                    provider_response_id: Some("resp_1".to_owned()),
-                    input_tokens: 3,
-                    output_tokens: 2,
+                StreamEvent::Completed(ResponseRound {
+                    completion: Completion {
+                        provider_response_id: Some("resp_1".to_owned()),
+                        input_tokens: 3,
+                        output_tokens: 2,
+                    },
+                    output_items: Vec::new(),
                 })
             ]
         );
@@ -620,15 +674,21 @@ mod tests {
     }
 
     #[test]
-    fn builds_a_strict_read_file_proposal_tool() {
+    fn builds_a_strict_read_file_tool_for_stateless_continuation() {
         let client = OpenAiClient::new(
             "https://example.test/v1",
             "test-secret".to_owned(),
             "test-model",
         );
-        let tools = proposal_tools();
+        let tools = read_file_tools();
+        let input = ToolInput::from_messages(&[Message::user("Inspect Cargo.toml")]).unwrap();
         let request = client
-            .build_request_with_tools("Be helpful", &[Message::user("Inspect Cargo.toml")], &tools)
+            .build_json_request(
+                "Be helpful",
+                input.items(),
+                &tools,
+                Some(&STATELESS_REASONING_INCLUDE),
+            )
             .unwrap();
         let body = serde_json::from_slice::<serde_json::Value>(
             request.body().and_then(reqwest::Body::as_bytes).unwrap(),
@@ -642,6 +702,39 @@ mod tests {
         assert_eq!(
             body["tools"][0]["parameters"]["additionalProperties"],
             false
+        );
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn replays_raw_output_items_before_function_outputs() {
+        let mut input = ToolInput::from_messages(&[Message::user("Inspect it")]).unwrap();
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "opaque"
+        });
+        let call = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": "{\"path\":\"Cargo.toml\"}"
+        });
+        input.append_output_items(vec![reasoning.clone(), call.clone()]);
+        input.append_function_output("call_1", "{\"ok\":true}".to_owned());
+
+        assert_eq!(
+            input.items(),
+            json!([
+                {"role": "user", "content": "Inspect it"},
+                reasoning,
+                call,
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "{\"ok\":true}"
+                }
+            ])
         );
     }
 

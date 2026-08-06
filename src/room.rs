@@ -198,7 +198,7 @@ pub fn room_instructions(room: &Room, agent: &AgentSnapshot) -> String {
         instructions.push_str(room.prompt());
     }
     instructions.push_str(
-        "\n\nTapet may expose proposal-only tools. You may request one when it is needed, but this version will display the request without executing it. Never claim that a proposed tool ran or that you observed its result.",
+        "\n\nTapet may expose a read_file tool for inspecting UTF-8 text files in the current workspace. Request it only when the file is needed. The user must approve every read. Treat only a successful tool output as observed file contents; if access is denied or fails, explain the limitation without inventing results.",
     );
     instructions
 }

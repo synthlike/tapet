@@ -6,6 +6,7 @@ mod room;
 mod store;
 mod stream;
 mod terminal;
+mod tool;
 mod ui;
 
 use agent::AgentSnapshot;
@@ -13,7 +14,7 @@ use config::{Agent, Config, ConfigError};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use message::Message;
-use openai::{OpenAiClient, ProviderError};
+use openai::{OpenAiClient, ProviderError, ToolInput};
 use room::{
     Room, RoomError, RoomId, RoomIdError, RoomMessage, RoomSpeaker, room_instructions,
     validate_participants,
@@ -24,10 +25,11 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process;
 use store::{Store, StoreError};
-use stream::{Completion, StreamEvent, ToolCall};
+use stream::{Completion, ResponseRound, StreamEvent, ToolCall};
 use terminal::InputSuppression;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+use tool::{MAX_TOOL_CALLS_PER_TURN, ReadFileRequest, error_output};
 use ui::{InputAction, RoomUi, TerminalUi};
 
 const CONFIG_PATH: &str = "tapet.toml";
@@ -344,16 +346,23 @@ async fn run_room_ui_turn(
             }
         };
         let instructions = room_instructions(room, participant);
-        let outcome = stream_room_response_ui(
-            &target,
-            &instructions,
-            &client,
-            &provider_messages,
-            terminal,
-            terminal_events,
-            state,
-        )
-        .await;
+        let outcome = {
+            let mut active_ui = ActiveRoomUi {
+                terminal,
+                terminal_events,
+                state,
+            };
+            stream_room_response_ui(
+                &target,
+                &instructions,
+                &client,
+                &provider_messages,
+                store,
+                call_id,
+                &mut active_ui,
+            )
+            .await
+        };
 
         match outcome {
             Ok(Some(response)) => {
@@ -385,74 +394,270 @@ async fn run_room_ui_turn(
     Ok(false)
 }
 
+struct ActiveRoomUi<'a> {
+    terminal: &'a mut TerminalUi,
+    terminal_events: &'a mut EventStream,
+    state: &'a mut RoomUi,
+}
+
 async fn stream_room_response_ui(
     agent_name: &str,
     system_prompt: &str,
     client: &OpenAiClient,
     messages: &[Message],
-    terminal: &mut TerminalUi,
-    terminal_events: &mut EventStream,
-    state: &mut RoomUi,
+    store: &Store,
+    room_call_id: i64,
+    ui: &mut ActiveRoomUi<'_>,
 ) -> Result<Option<AssistantResponse>, AppError> {
-    let request = client.stream_with_tool_proposals(system_prompt, messages);
-    tokio::pin!(request);
-    let mut events = loop {
-        tokio::select! {
-            result = &mut request => break result?,
-            event = next_terminal_event(terminal_events) => {
-                let event = event?;
-                if is_exit_event(&event) {
-                    return Ok(None);
-                }
-                state.handle_passive_event(&event);
-                terminal.draw(state)?;
-            }
-        }
+    let mut input = ToolInput::from_messages(messages)?;
+    let mut usage = Completion {
+        provider_response_id: None,
+        input_tokens: 0,
+        output_tokens: 0,
     };
+    let mut tool_calls = 0;
+    loop {
+        let tools_enabled = tool_calls < MAX_TOOL_CALLS_PER_TURN;
+        let events = {
+            let request = client.stream_with_tools(system_prompt, &input, tools_enabled);
+            tokio::pin!(request);
+            loop {
+                tokio::select! {
+                    result = &mut request => break result?,
+                    event = next_terminal_event(ui.terminal_events) => {
+                        let event = event?;
+                        if is_exit_event(&event) {
+                            return Ok(None);
+                        }
+                        ui.state.handle_passive_event(&event);
+                        ui.terminal.draw(ui.state)?;
+                    }
+                }
+            }
+        };
+        let round = stream_room_round_ui(agent_name, events, ui).await?;
+        let Some(round) = round else {
+            return Ok(None);
+        };
+        add_usage(&mut usage, &round.response.completion);
+        input.append_output_items(round.response.output_items);
+
+        if round.tool_calls.is_empty() {
+            return Ok(Some(AssistantResponse {
+                text: round.text,
+                completion: usage,
+            }));
+        }
+
+        ui.state.reset_response_content();
+        ui.terminal.draw(ui.state)?;
+        for call in round.tool_calls {
+            let record_id = store.record_tool_proposal(room_call_id, &call).await?;
+            if tool_calls >= MAX_TOOL_CALLS_PER_TURN {
+                let error =
+                    format!("tool-call limit of {MAX_TOOL_CALLS_PER_TURN} reached for this turn");
+                store.fail_tool_call(record_id, error.clone()).await?;
+                ui.state
+                    .push_tool_notice(format!("✗ {} · {error}", call.name));
+                input.append_function_output(&call.call_id, error_output(&error));
+                continue;
+            }
+            tool_calls += 1;
+            let Some(output) = run_read_file_ui(agent_name, &call, record_id, store, ui).await?
+            else {
+                return Ok(None);
+            };
+            input.append_function_output(&call.call_id, output);
+        }
+        ui.state
+            .set_status(format!("@{agent_name} is responding..."));
+    }
+}
+
+struct RoomResponseRound {
+    text: String,
+    tool_calls: Vec<ToolCall>,
+    response: ResponseRound,
+}
+
+async fn stream_room_round_ui<S>(
+    agent_name: &str,
+    mut events: S,
+    ui: &mut ActiveRoomUi<'_>,
+) -> Result<Option<RoomResponseRound>, AppError>
+where
+    S: Stream<Item = Result<StreamEvent, ProviderError>> + Unpin,
+{
     let mut filter = LeadingAttributionFilter::new(agent_name);
-    let mut message = String::new();
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
 
     loop {
         tokio::select! {
-            event = events.next() => {
-                match event {
-                    Some(Ok(StreamEvent::TextDelta(delta))) => {
-                        let visible = filter.push(&delta);
-                        if !visible.is_empty() {
-                            message.push_str(&visible);
-                            state.push_response_delta(&visible);
-                            terminal.draw(state)?;
-                        }
+            event = events.next() => match event {
+                Some(Ok(StreamEvent::TextDelta(delta))) => {
+                    let visible = filter.push(&delta);
+                    if !visible.is_empty() {
+                        text.push_str(&visible);
+                        ui.state.push_response_delta(&visible);
+                        ui.terminal.draw(ui.state)?;
                     }
-                    Some(Ok(StreamEvent::ToolCallProposed(call))) => {
-                        let pending = filter.finish();
-                        append_ui_response(state, &mut message, &pending);
-                        let proposal = format_tool_proposal(&call);
-                        append_ui_response(state, &mut message, &proposal);
-                        terminal.draw(state)?;
-                    }
-                    Some(Ok(StreamEvent::Completed(completion))) => {
-                        let visible = filter.finish();
-                        if !visible.is_empty() {
-                            message.push_str(&visible);
-                            state.push_response_delta(&visible);
-                            terminal.draw(state)?;
-                        }
-                        return Ok(Some(AssistantResponse { text: message, completion }));
-                    }
-                    Some(Err(error)) => return Err(error.into()),
-                    None => return Err(ProviderError::IncompleteStream.into()),
                 }
-            }
-            event = next_terminal_event(terminal_events) => {
+                Some(Ok(StreamEvent::ToolCallProposed(call))) => tool_calls.push(call),
+                Some(Ok(StreamEvent::Completed(response))) => {
+                    let visible = filter.finish();
+                    if !visible.is_empty() {
+                        text.push_str(&visible);
+                        ui.state.push_response_delta(&visible);
+                        ui.terminal.draw(ui.state)?;
+                    }
+                    return Ok(Some(RoomResponseRound { text, tool_calls, response }));
+                }
+                Some(Err(error)) => return Err(error.into()),
+                None => return Err(ProviderError::IncompleteStream.into()),
+            },
+            event = next_terminal_event(ui.terminal_events) => {
                 let event = event?;
                 if is_exit_event(&event) {
                     return Ok(None);
                 }
-                state.handle_passive_event(&event);
-                terminal.draw(state)?;
+                ui.state.handle_passive_event(&event);
+                ui.terminal.draw(ui.state)?;
             }
         }
+    }
+}
+
+async fn run_read_file_ui(
+    agent_name: &str,
+    call: &ToolCall,
+    record_id: i64,
+    store: &Store,
+    ui: &mut ActiveRoomUi<'_>,
+) -> Result<Option<String>, AppError> {
+    if call.name != "read_file" {
+        let error = format!("unknown tool `{}`", call.name);
+        store.fail_tool_call(record_id, error.clone()).await?;
+        ui.state
+            .push_tool_notice(format!("✗ {} · {error}", call.name));
+        return Ok(Some(error_output(&error)));
+    }
+    let request = match ReadFileRequest::parse(&call.arguments) {
+        Ok(request) => request,
+        Err(error) => {
+            store.fail_tool_call(record_id, error.to_string()).await?;
+            ui.state.push_tool_notice(format!("✗ read_file · {error}"));
+            return Ok(Some(error_output(&error)));
+        }
+    };
+    let path = request.display_path();
+    ui.state.request_tool_approval(agent_name, &path);
+    ui.terminal.draw(ui.state)?;
+
+    let approved = loop {
+        let event = next_terminal_event(ui.terminal_events).await?;
+        if is_exit_event(&event) {
+            ui.state.clear_tool_approval();
+            store
+                .fail_tool_call(record_id, "cancelled by user".to_owned())
+                .await?;
+            return Ok(None);
+        }
+        match &event {
+            Event::Key(key)
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) =>
+            {
+                break true;
+            }
+            Event::Key(key)
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N')) =>
+            {
+                break false;
+            }
+            _ => {
+                ui.state.handle_passive_event(&event);
+                ui.terminal.draw(ui.state)?;
+            }
+        }
+    };
+    ui.state.clear_tool_approval();
+
+    if !approved {
+        store.deny_tool_call(record_id).await?;
+        ui.state
+            .push_tool_notice(format!("○ @{agent_name} read {path} · denied"));
+        ui.terminal.draw(ui.state)?;
+        return Ok(Some(error_output(&"user denied file access")));
+    }
+
+    store.approve_tool_call(record_id).await?;
+    store.start_tool_call(record_id).await?;
+    ui.state
+        .set_status(format!("@{agent_name} is reading {path}..."));
+    ui.terminal.draw(ui.state)?;
+    let workspace = env::current_dir()?;
+    let task = tokio::task::spawn_blocking(move || request.execute(&workspace));
+    tokio::pin!(task);
+    let result = loop {
+        tokio::select! {
+            result = &mut task => match result {
+                Ok(result) => break result,
+                Err(error) => {
+                    store.fail_tool_call(record_id, error.to_string()).await?;
+                    return Err(AppError::ToolTask(error));
+                }
+            },
+            event = next_terminal_event(ui.terminal_events) => {
+                let event = event?;
+                if is_exit_event(&event) {
+                    store.fail_tool_call(record_id, "cancelled by user".to_owned()).await?;
+                    return Ok(None);
+                }
+                ui.state.handle_passive_event(&event);
+                ui.terminal.draw(ui.state)?;
+            }
+        }
+    };
+
+    match result {
+        Ok(output) => {
+            store
+                .complete_tool_call(record_id, output.bytes, output.lines)
+                .await?;
+            ui.state.push_tool_notice(format!(
+                "✓ @{agent_name} read {} · {} lines · {}",
+                output.path,
+                output.lines,
+                format_bytes(output.bytes)
+            ));
+            ui.terminal.draw(ui.state)?;
+            Ok(Some(serde_json::to_string(&output)?))
+        }
+        Err(error) => {
+            store.fail_tool_call(record_id, error.to_string()).await?;
+            ui.state
+                .push_tool_notice(format!("✗ @{agent_name} read {path} · {error}"));
+            ui.terminal.draw(ui.state)?;
+            Ok(Some(error_output(&error)))
+        }
+    }
+}
+
+fn add_usage(total: &mut Completion, round: &Completion) {
+    total
+        .provider_response_id
+        .clone_from(&round.provider_response_id);
+    total.input_tokens = total.input_tokens.saturating_add(round.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(round.output_tokens);
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
     }
 }
 
@@ -546,6 +751,8 @@ async fn run_room(
                     &client,
                     &provider_messages,
                     &mut output,
+                    &store,
+                    call_id,
                 ) => TurnOutcome::Response(result),
                 result = tokio::signal::ctrl_c() => TurnOutcome::Interrupted(result),
             };
@@ -615,21 +822,52 @@ async fn render_room_response(
     client: &OpenAiClient,
     messages: &[Message],
     output: &mut impl Write,
+    store: &Store,
+    room_call_id: i64,
 ) -> Result<AssistantResponse, AppError> {
-    let events = client
-        .stream_with_tool_proposals(system_prompt, messages)
-        .await?;
     write!(output, "{agent_name}> ")?;
     output.flush()?;
+    let mut input = ToolInput::from_messages(messages)?;
+    let mut usage = Completion {
+        provider_response_id: None,
+        input_tokens: 0,
+        output_tokens: 0,
+    };
+    let mut tool_calls = 0;
 
-    match render_room_events(events, agent_name, output).await {
-        Ok(message) => {
+    loop {
+        let events = client
+            .stream_with_tools(system_prompt, &input, tool_calls < MAX_TOOL_CALLS_PER_TURN)
+            .await?;
+        let round = match render_room_events(events, agent_name, output).await {
+            Ok(round) => round,
+            Err(error) => {
+                let _ = writeln!(output);
+                return Err(error);
+            }
+        };
+        add_usage(&mut usage, &round.response.completion);
+        input.append_output_items(round.response.output_items);
+        if round.tool_calls.is_empty() {
             writeln!(output)?;
-            Ok(message)
+            return Ok(AssistantResponse {
+                text: round.text,
+                completion: usage,
+            });
         }
-        Err(error) => {
-            let _ = writeln!(output);
-            Err(error)
+
+        for call in round.tool_calls {
+            let record_id = store.record_tool_proposal(room_call_id, &call).await?;
+            store.deny_tool_call(record_id).await?;
+            tool_calls += 1;
+            let reason = "interactive approval is unavailable when input or output is redirected";
+            input.append_function_output(&call.call_id, error_output(&reason));
+            writeln!(
+                output,
+                "\ntapet> denied {} · {reason}\n{agent_name}> ",
+                call.name
+            )?;
+            output.flush()?;
         }
     }
 }
@@ -656,14 +894,11 @@ where
                 output.flush()?;
                 message.push_str(&delta);
             }
-            StreamEvent::ToolCallProposed(call) => {
-                let proposal = format_tool_proposal(&call);
-                write_response_part(output, &mut message, &proposal)?;
-            }
-            StreamEvent::Completed(completion) => {
+            StreamEvent::ToolCallProposed(_) => {}
+            StreamEvent::Completed(response) => {
                 return Ok(AssistantResponse {
                     text: message,
-                    completion,
+                    completion: response.completion,
                 });
             }
         }
@@ -676,12 +911,13 @@ async fn render_room_events<S>(
     mut events: S,
     agent_name: &str,
     output: &mut impl Write,
-) -> Result<AssistantResponse, AppError>
+) -> Result<RoomResponseRound, AppError>
 where
     S: Stream<Item = Result<StreamEvent, ProviderError>> + Unpin,
 {
     let mut filter = LeadingAttributionFilter::new(agent_name);
     let mut message = String::new();
+    let mut tool_calls = Vec::new();
 
     while let Some(event) = events.next().await {
         match event? {
@@ -693,67 +929,24 @@ where
                     message.push_str(&visible);
                 }
             }
-            StreamEvent::ToolCallProposed(call) => {
-                let pending = filter.finish();
-                write_response_part(output, &mut message, &pending)?;
-                let proposal = format_tool_proposal(&call);
-                write_response_part(output, &mut message, &proposal)?;
-            }
-            StreamEvent::Completed(completion) => {
+            StreamEvent::ToolCallProposed(call) => tool_calls.push(call),
+            StreamEvent::Completed(response) => {
                 let visible = filter.finish();
                 output.write_all(visible.as_bytes())?;
                 if !visible.is_empty() {
                     output.flush()?;
                     message.push_str(&visible);
                 }
-                return Ok(AssistantResponse {
+                return Ok(RoomResponseRound {
                     text: message,
-                    completion,
+                    tool_calls,
+                    response,
                 });
             }
         }
     }
 
     Err(ProviderError::IncompleteStream.into())
-}
-
-fn append_ui_response(state: &mut RoomUi, message: &mut String, part: &str) {
-    if part.is_empty() {
-        return;
-    }
-    let separator = if message.is_empty() { "" } else { "\n\n" };
-    message.push_str(separator);
-    message.push_str(part);
-    state.push_response_delta(separator);
-    state.push_response_delta(part);
-}
-
-fn write_response_part(
-    output: &mut impl Write,
-    message: &mut String,
-    part: &str,
-) -> io::Result<()> {
-    if part.is_empty() {
-        return Ok(());
-    }
-    if !message.is_empty() {
-        output.write_all(b"\n\n")?;
-        message.push_str("\n\n");
-    }
-    output.write_all(part.as_bytes())?;
-    output.flush()?;
-    message.push_str(part);
-    Ok(())
-}
-
-fn format_tool_proposal(call: &ToolCall) -> String {
-    let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
-        .map(|arguments| serde_json::to_string_pretty(&arguments).expect("JSON value serializes"))
-        .unwrap_or_else(|_| call.arguments.clone());
-    format!(
-        "[tool proposal — not executed]\n{} {}",
-        call.name, arguments
-    )
 }
 
 struct LeadingAttributionFilter {
@@ -883,6 +1076,10 @@ enum AppError {
     Store(#[from] StoreError),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error("tool worker failed: {0}")]
+    ToolTask(#[source] tokio::task::JoinError),
+    #[error("could not serialize a tool result: {0}")]
+    ToolJson(#[from] serde_json::Error),
 }
 
 #[cfg(test)]
@@ -894,7 +1091,7 @@ mod tests {
     use crate::config::Config;
     use crate::openai::{ProviderError, decode_stream};
     use crate::room::RoomMessage;
-    use crate::stream::{Completion, StreamEvent, ToolCall};
+    use crate::stream::{Completion, ResponseRound, StreamEvent, ToolCall};
     use futures_util::stream;
     use std::ffi::OsString;
     use std::fs;
@@ -1112,7 +1309,7 @@ mod tests {
         let events = stream::iter([
             Ok(StreamEvent::TextDelta("Owner".to_owned())),
             Ok(StreamEvent::TextDelta("ship".to_owned())),
-            Ok(StreamEvent::Completed(completion())),
+            Ok(StreamEvent::Completed(response_round())),
         ]);
         let mut output = TrackingWriter::default();
 
@@ -1129,7 +1326,7 @@ mod tests {
             Ok(StreamEvent::TextDelta("@SH".to_owned())),
             Ok(StreamEvent::TextDelta("OUTER: ".to_owned())),
             Ok(StreamEvent::TextDelta("HELLO".to_owned())),
-            Ok(StreamEvent::Completed(completion())),
+            Ok(StreamEvent::Completed(response_round())),
         ]);
         let mut output = TrackingWriter::default();
 
@@ -1147,7 +1344,7 @@ mod tests {
         let events = stream::iter([
             Ok(StreamEvent::TextDelta("@exploration".to_owned())),
             Ok(StreamEvent::TextDelta(" continues".to_owned())),
-            Ok(StreamEvent::Completed(completion())),
+            Ok(StreamEvent::Completed(response_round())),
         ]);
         let mut output = Vec::new();
 
@@ -1160,14 +1357,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn room_tool_proposals_are_visible_stored_text_and_never_executed() {
+    async fn room_tool_proposals_are_returned_for_the_execution_loop() {
         let events = stream::iter([
             Ok(StreamEvent::ToolCallProposed(ToolCall {
                 call_id: "call_1".to_owned(),
                 name: "read_file".to_owned(),
                 arguments: "{\"path\":\"Cargo.toml\"}".to_owned(),
             })),
-            Ok(StreamEvent::Completed(completion())),
+            Ok(StreamEvent::Completed(response_round())),
         ]);
         let mut output = Vec::new();
 
@@ -1175,10 +1372,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(String::from_utf8(output).unwrap(), message.text);
-        assert!(message.text.contains("[tool proposal — not executed]"));
-        assert!(message.text.contains("read_file"));
-        assert!(message.text.contains("Cargo.toml"));
+        assert!(String::from_utf8(output).unwrap().is_empty());
+        assert!(message.text.is_empty());
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(message.tool_calls[0].name, "read_file");
+        assert_eq!(message.tool_calls[0].arguments, "{\"path\":\"Cargo.toml\"}");
     }
 
     #[tokio::test]
@@ -1201,11 +1399,14 @@ mod tests {
         assert_eq!(output, b"partial");
     }
 
-    fn completion() -> Completion {
-        Completion {
-            provider_response_id: Some("resp_test".to_owned()),
-            input_tokens: 1,
-            output_tokens: 1,
+    fn response_round() -> ResponseRound {
+        ResponseRound {
+            completion: Completion {
+                provider_response_id: Some("resp_test".to_owned()),
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+            output_items: Vec::new(),
         }
     }
 

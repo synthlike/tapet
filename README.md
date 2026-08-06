@@ -32,6 +32,31 @@ tapet enter room_...             # resume a room
 tapet history room_...           # print room history
 ```
 
+Interactive rooms support mouse-wheel scrollback, Up/Down input history, and
+Tab completion for `@agent` mentions and `/` commands.
+
+## Reading workspace files
+
+Room agents can request the `read_file` tool when they need source context.
+Tapet pauses before every read and shows the requested path:
+
+```text
+@explorer wants to read src/main.rs
+The file contents will be sent to the model.
+
+[y] Allow once    [n] Deny
+```
+
+An approval applies to that read only. Paths must be relative to the current
+workspace; traversal, files outside the workspace, `.git`, `.tapet`, `.env`
+files, common private-key formats, non-UTF-8 files, and files over 128 KiB are
+rejected. Redirected input or output disables execution because Tapet cannot
+ask for interactive approval.
+
+Tapet records the tool name, arguments, decision, status, and result size in
+SQLite for auditing. File contents are sent to the selected model after
+approval but are not stored in the database.
+
 ## Configuration
 
 Reusable room templates live alongside providers, models, and agents in
