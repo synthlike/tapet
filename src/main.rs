@@ -35,11 +35,41 @@ use ui::{InputAction, RoomUi, TerminalUi};
 const CONFIG_PATH: &str = "tapet.toml";
 const DATABASE_PATH: &str = ".tapet/tapet.db";
 
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Tapet configuration.
+version = 1
+
+[providers.openai]
+type = "openai"
+api_key_env = "OPENAI_API_KEY"   # export this before running tapet
+
+[models.default]
+provider = "openai"
+model = "gpt-5.6-sol"            # replace with the model you want to use
+
+[agents.assistant]
+model = "default"
+prompt = "You are a helpful assistant."
+
+# A room template lets `tapet room --from chat` start a saved conversation
+# with the agents below. `tapet ask` and `tapet room --with <agent>` work
+# without any [rooms.*] section too.
+[rooms.chat]
+agents = ["assistant"]
+default = "assistant"
+description = "General-purpose chat room."
+prompt = "Be concise and helpful."
+
+# Add more [agents.*] and [rooms.*] as needed. See
+# https://github.com/synthlike/tapet for a full example with multiple
+# agents and a room template.
+"#;
+
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Agents,
     Templates,
     Rooms,
+    ConfigInit,
     Ask {
         agent: String,
         message: String,
@@ -87,6 +117,13 @@ fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command,
                 return Err(AppError::Usage);
             }
             Ok(Command::Rooms)
+        }
+        "config" => {
+            let sub = next_argument(&mut args)?;
+            if sub != "init" || args.next().is_some() {
+                return Err(AppError::Usage);
+            }
+            Ok(Command::ConfigInit)
         }
         "ask" => {
             let agent = next_argument(&mut args)?;
@@ -198,6 +235,10 @@ async fn try_main() -> Result<(), AppError> {
             let rooms = store.list_rooms().await?;
             let stdout = io::stdout();
             write_room_list(&rooms, &mut stdout.lock())?;
+        }
+        Command::ConfigInit => {
+            let stdout = io::stdout();
+            write!(stdout.lock(), "{DEFAULT_CONFIG_TEMPLATE}")?;
         }
         Command::Ask {
             agent: agent_name,
@@ -1220,7 +1261,7 @@ async fn main() {
 #[derive(Debug, Error)]
 enum AppError {
     #[error(
-        "usage: tapet [--config <path>] agents\n       tapet [--config <path>] templates\n       tapet rooms\n       tapet [--config <path>] ask <agent> <message>\n       tapet [--config <path>] room [--name <name>] --with <agent> [--with <agent>...]\n       tapet [--config <path>] room [--name <name>] --from <template>\n       tapet enter <room>\n       tapet history <room>"
+        "usage: tapet [--config <path>] agents\n       tapet [--config <path>] templates\n       tapet rooms\n       tapet config init\n       tapet [--config <path>] ask <agent> <message>\n       tapet [--config <path>] room [--name <name>] --with <agent> [--with <agent>...]\n       tapet [--config <path>] room [--name <name>] --from <template>\n       tapet enter <room>\n       tapet history <room>"
     )]
     Usage,
     #[error(transparent)]
@@ -1246,9 +1287,9 @@ enum AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, RoomSource, UserInput, extract_config_path, read_user_input, render_events,
-        render_room_events, selected_command, write_agents, write_room_history, write_room_list,
-        write_templates,
+        Command, DEFAULT_CONFIG_TEMPLATE, RoomSource, UserInput, extract_config_path,
+        read_user_input, render_events, render_room_events, selected_command, write_agents,
+        write_room_history, write_room_list, write_templates,
     };
     use crate::config::Config;
     use crate::openai::{ProviderError, decode_stream};
@@ -1349,6 +1390,46 @@ mod tests {
             selected_command([OsString::from("rooms"), OsString::from("extra")].into_iter())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_config_init_command() {
+        assert_eq!(
+            selected_command([OsString::from("config"), OsString::from("init")].into_iter())
+                .unwrap(),
+            Command::ConfigInit
+        );
+        assert!(selected_command([OsString::from("config")].into_iter()).is_err());
+        assert!(
+            selected_command([OsString::from("config"), OsString::from("bogus")].into_iter())
+                .is_err()
+        );
+        assert!(
+            selected_command(
+                [
+                    OsString::from("config"),
+                    OsString::from("init"),
+                    OsString::from("extra")
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn default_config_template_is_a_loadable_config() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("tapet.toml");
+        fs::write(&path, DEFAULT_CONFIG_TEMPLATE).unwrap();
+
+        let config = Config::load(&path).unwrap();
+        let agent = config.agent("assistant").unwrap();
+        assert_eq!(agent.provider_name(), "openai");
+        assert_eq!(agent.model(), "gpt-5.6-sol");
+
+        let room = config.room("chat").unwrap();
+        assert_eq!(room.agents(), ["assistant"]);
     }
 
     #[test]

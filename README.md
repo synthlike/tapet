@@ -33,10 +33,12 @@ cargo install --path .
 
 ## Usage
 
-Configure providers, model aliases, and agents in `tapet.toml`, then export the
-API-key environment variable named by the provider.
+Generate a starter `tapet.toml` (or write your own — see Configuration below),
+then export the API-key environment variable named by the provider.
 
 ```sh
+tapet config init > tapet.toml                  # generate a starter config
+
 tapet agents                                    # list configured agents
 tapet templates                                 # list tapet.toml room templates
 tapet rooms                                     # list rooms you can enter, most recent first
