@@ -42,11 +42,11 @@ must be unique within the local Tapet database.
 Interactive rooms support mouse-wheel scrollback, Up/Down input history, and
 Tab completion for `@agent` mentions and `/` commands.
 
-## Reading workspace files
+## Working with workspace files
 
-Room agents can request the `read_file` and `list_files` tools when they need
-source context. Tapet pauses before every use and shows what's being
-requested:
+Room agents can request the `read_file`, `list_files`, and `write_file` tools
+when they need source context or want to make a change. Tapet pauses before
+every use and shows what's being requested:
 
 ```text
 @explorer wants to read src/main.rs
@@ -55,17 +55,35 @@ The file contents will be sent to the model.
 [y] Allow once    [n] Deny
 ```
 
+`write_file` shows a diff against the current file (or the whole file as
+additions, for a new one) instead of just a path, so you can see the change
+before approving it:
+
+```text
+@explorer wants to write src/main.rs
+This overwrites the file on disk.
+
+  fn main() {
+-     println!("hello");
++     println!("hello, world");
+  }
+
+[y] Allow once    [n] Deny
+```
+
 An approval applies to that call only. Paths must be relative to the current
 workspace; traversal, paths outside the workspace, `.git`, `.tapet`, `.env`
-files, and common private-key formats are rejected. `read_file` additionally
-rejects non-UTF-8 files and files over 128 KiB; `list_files` lists a single
-directory's immediate entries (non-recursive) and rejects directories with
-more than 500 entries. Redirected input or output disables execution because
-Tapet cannot ask for interactive approval.
+files, and common private-key formats are rejected. `read_file` and
+`write_file` reject non-UTF-8 content and content over 128 KiB; `write_file`
+also requires the parent directory to already exist (Tapet never creates
+directories implicitly) and refuses to overwrite a directory. `list_files`
+lists a single directory's immediate entries (non-recursive) and rejects
+directories with more than 500 entries. Redirected input or output disables
+execution because Tapet cannot ask for interactive approval.
 
 Tapet records the tool name, arguments, decision, status, and result size in
-SQLite for auditing. File contents and directory listings are sent to the
-selected model after approval but are not stored in the database.
+SQLite for auditing. File contents, diffs, and directory listings are sent to
+the selected model after approval but are not stored in the database.
 
 ## Configuration
 

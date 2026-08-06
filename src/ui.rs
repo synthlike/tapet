@@ -1,4 +1,5 @@
 use crate::room::{Room, RoomMessage, RoomSpeaker};
+use crate::tool::{DiffLine, DiffLineKind, ToolApprovalPreview};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseEventKind,
@@ -86,8 +87,7 @@ struct LiveResponse {
 
 struct ToolApproval {
     agent: String,
-    verb: &'static str,
-    path: String,
+    preview: ToolApprovalPreview,
 }
 
 struct CompletionMenu {
@@ -191,11 +191,10 @@ impl RoomUi {
         self.follow_output = true;
     }
 
-    pub fn request_tool_approval(&mut self, agent: &str, verb: &'static str, path: &str) {
+    pub fn request_tool_approval(&mut self, agent: &str, preview: ToolApprovalPreview) {
         self.tool_approval = Some(ToolApproval {
             agent: agent.to_owned(),
-            verb,
-            path: path.to_owned(),
+            preview,
         });
         self.set_status("Tool approval required");
     }
@@ -587,54 +586,113 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &mut RoomUi) {
     render_tool_approval(frame, state);
 }
 
+const MAX_DIFF_PREVIEW_LINES: usize = 20;
+
 fn render_tool_approval(frame: &mut Frame<'_>, state: &RoomUi) {
     let Some(approval) = &state.tool_approval else {
         return;
     };
     let frame_area = frame.area();
-    let width = frame_area.width.saturating_sub(4).min(72);
+    let width = frame_area.width.saturating_sub(4).min(96);
     if width < 20 || frame_area.height < 5 {
         return;
     }
-    let height = 7.min(frame_area.height);
+
+    let (title, mut content) = match &approval.preview {
+        ToolApprovalPreview::Path { verb, path } => {
+            let caution = match *verb {
+                "list" => "The directory listing will be sent to the model.",
+                _ => "The file contents will be sent to the model.",
+            };
+            (
+                format!(" {verb} approval "),
+                vec![
+                    approval_header(&approval.agent, verb, path),
+                    Line::default(),
+                    Line::styled(caution, Style::default().fg(Color::Yellow)),
+                ],
+            )
+        }
+        ToolApprovalPreview::Diff {
+            verb,
+            path,
+            is_new_file,
+            diff,
+        } => {
+            let caution = if *is_new_file {
+                "This creates a new file on disk."
+            } else {
+                "This overwrites the file on disk."
+            };
+            let mut lines = vec![
+                approval_header(&approval.agent, verb, path),
+                Line::default(),
+                Line::styled(caution, Style::default().fg(Color::Yellow)),
+                Line::default(),
+            ];
+            lines.extend(render_diff_lines(diff));
+            (format!(" {verb} approval "), lines)
+        }
+    };
+    content.push(Line::default());
+    content.push(Line::from(vec![
+        Span::styled("[y] Allow once", Style::default().fg(Color::Green)),
+        Span::raw("    "),
+        Span::styled("[n] Deny", Style::default().fg(Color::Red)),
+    ]));
+
+    let height = u16::try_from(content.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(frame_area.height);
     let area = Rect::new(
         frame_area.x + frame_area.width.saturating_sub(width) / 2,
         frame_area.y + frame_area.height.saturating_sub(height) / 2,
         width,
         height,
     );
-    let caution = match approval.verb {
-        "list" => "The directory listing will be sent to the model.",
-        _ => "The file contents will be sent to the model.",
-    };
-    let content = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("@{}", approval.agent),
-                Style::default().fg(Color::Magenta),
-            ),
-            Span::raw(format!(" wants to {} ", approval.verb)),
-            Span::styled(&approval.path, Style::default().fg(Color::Cyan)),
-        ]),
-        Line::default(),
-        Line::styled(caution, Style::default().fg(Color::Yellow)),
-        Line::default(),
-        Line::from(vec![
-            Span::styled("[y] Allow once", Style::default().fg(Color::Green)),
-            Span::raw("    "),
-            Span::styled("[n] Deny", Style::default().fg(Color::Red)),
-        ]),
-    ];
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(content).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" {} approval ", approval.verb))
+                .title(title)
                 .border_style(Style::default().fg(Color::Yellow)),
         ),
         area,
     );
+}
+
+fn approval_header<'a>(agent: &'a str, verb: &'a str, path: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(format!("@{agent}"), Style::default().fg(Color::Magenta)),
+        Span::raw(format!(" wants to {verb} ")),
+        Span::styled(path, Style::default().fg(Color::Cyan)),
+    ])
+}
+
+fn render_diff_lines(diff: &[DiffLine]) -> Vec<Line<'static>> {
+    let shown = diff.len().min(MAX_DIFF_PREVIEW_LINES);
+    let mut lines: Vec<Line<'static>> = diff[..shown]
+        .iter()
+        .map(|line| {
+            let (marker, color) = match line.kind {
+                DiffLineKind::Added => ('+', Color::Green),
+                DiffLineKind::Removed => ('-', Color::Red),
+                DiffLineKind::Context => (' ', Color::DarkGray),
+            };
+            Line::styled(
+                format!("{marker} {}", line.content),
+                Style::default().fg(color),
+            )
+        })
+        .collect();
+    if diff.len() > shown {
+        lines.push(Line::styled(
+            format!("… {} more line(s) not shown", diff.len() - shown),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines
 }
 
 fn render_completion(frame: &mut Frame<'_>, state: &RoomUi, area: Rect) {

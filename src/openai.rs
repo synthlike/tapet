@@ -182,7 +182,7 @@ struct FunctionTool {
     strict: bool,
 }
 
-fn available_tools() -> [FunctionTool; 2] {
+fn available_tools() -> [FunctionTool; 3] {
     [
         FunctionTool {
             kind: "function",
@@ -214,6 +214,27 @@ fn available_tools() -> [FunctionTool; 2] {
                     }
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }),
+            strict: true,
+        },
+        FunctionTool {
+            kind: "function",
+            name: "write_file",
+            description: "Write UTF-8 text to a workspace-relative file after the user reviews a diff and approves. Creates the file if it doesn't exist; the parent directory must already exist.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative path of the file to write"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full replacement contents of the file"
+                    }
+                },
+                "required": ["path", "content"],
                 "additionalProperties": false
             }),
             strict: true,

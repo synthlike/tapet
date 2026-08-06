@@ -563,7 +563,17 @@ async fn run_tool_ui(
     };
     let verb = request.verb();
     let path = request.display_path();
-    ui.state.request_tool_approval(agent_name, verb, &path);
+    let workspace = env::current_dir()?;
+    let preview = match request.approval_preview(&workspace) {
+        Ok(preview) => preview,
+        Err(error) => {
+            store.fail_tool_call(record_id, error.to_string()).await?;
+            ui.state
+                .push_tool_notice(format!("✗ @{agent_name} {verb} {path} · {error}"));
+            return Ok(Some(error_output(&error)));
+        }
+    };
+    ui.state.request_tool_approval(agent_name, preview);
     ui.terminal.draw(ui.state)?;
 
     let approved = loop {
@@ -609,7 +619,6 @@ async fn run_tool_ui(
     ui.state
         .set_status(format!("@{agent_name} is {verb}ing {path}..."));
     ui.terminal.draw(ui.state)?;
-    let workspace = env::current_dir()?;
     let request_for_label = request.clone();
     let task = tokio::task::spawn_blocking(move || request.execute(&workspace));
     tokio::pin!(task);

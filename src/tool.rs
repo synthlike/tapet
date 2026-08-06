@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -15,6 +16,7 @@ const MAX_LIST_ENTRIES: usize = 500;
 pub enum ToolRequest {
     ReadFile(ReadFileRequest),
     ListFiles(ListFilesRequest),
+    WriteFile(WriteFileRequest),
 }
 
 pub struct ToolOutcome {
@@ -23,11 +25,41 @@ pub struct ToolOutcome {
     pub lines: u64,
 }
 
+/// What to show the user before a tool runs. Built without side effects for
+/// read-only tools; `write_file` reads the current on-disk content to build
+/// its diff, which is the one case where approval requires a disk read.
+pub enum ToolApprovalPreview {
+    Path {
+        verb: &'static str,
+        path: String,
+    },
+    Diff {
+        verb: &'static str,
+        path: String,
+        is_new_file: bool,
+        diff: Vec<DiffLine>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub content: String,
+}
+
 impl ToolRequest {
     pub fn parse(name: &str, arguments: &str) -> Result<Self, ToolError> {
         match name {
             "read_file" => Ok(Self::ReadFile(ReadFileRequest::parse(arguments)?)),
             "list_files" => Ok(Self::ListFiles(ListFilesRequest::parse(arguments)?)),
+            "write_file" => Ok(Self::WriteFile(WriteFileRequest::parse(arguments)?)),
             other => Err(ToolError::UnknownTool(other.to_owned())),
         }
     }
@@ -36,13 +68,14 @@ impl ToolRequest {
         match self {
             Self::ReadFile(_) => "read",
             Self::ListFiles(_) => "list",
+            Self::WriteFile(_) => "write",
         }
     }
 
     pub fn count_label(&self, count: u64) -> &'static str {
         match (self, count) {
-            (Self::ReadFile(_), 1) => "line",
-            (Self::ReadFile(_), _) => "lines",
+            (Self::ReadFile(_) | Self::WriteFile(_), 1) => "line",
+            (Self::ReadFile(_) | Self::WriteFile(_), _) => "lines",
             (Self::ListFiles(_), 1) => "entry",
             (Self::ListFiles(_), _) => "entries",
         }
@@ -52,6 +85,17 @@ impl ToolRequest {
         match self {
             Self::ReadFile(request) => request.display_path(),
             Self::ListFiles(request) => request.display_path(),
+            Self::WriteFile(request) => request.display_path(),
+        }
+    }
+
+    pub fn approval_preview(&self, workspace: &Path) -> Result<ToolApprovalPreview, ToolError> {
+        match self {
+            Self::WriteFile(request) => request.approval_preview(workspace),
+            _ => Ok(ToolApprovalPreview::Path {
+                verb: self.verb(),
+                path: self.display_path(),
+            }),
         }
     }
 
@@ -59,6 +103,7 @@ impl ToolRequest {
         match self {
             Self::ReadFile(request) => request.execute(workspace).map(ToolOutcome::from),
             Self::ListFiles(request) => request.execute(workspace).map(ToolOutcome::from),
+            Self::WriteFile(request) => request.execute(workspace).map(ToolOutcome::from),
         }
     }
 }
@@ -79,6 +124,16 @@ impl From<ListFilesOutput> for ToolOutcome {
             bytes: output.bytes,
             lines: output.entries.len() as u64,
             json: serde_json::to_string(&output).expect("list_files output is serializable"),
+        }
+    }
+}
+
+impl From<WriteFileOutput> for ToolOutcome {
+    fn from(output: WriteFileOutput) -> Self {
+        Self {
+            bytes: output.bytes,
+            lines: output.lines,
+            json: serde_json::to_string(&output).expect("write_file output is serializable"),
         }
     }
 }
@@ -262,6 +317,167 @@ impl ListFilesRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriteFileRequest {
+    path: PathBuf,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteFileArguments {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteFileOutput {
+    pub ok: bool,
+    pub path: String,
+    pub bytes: u64,
+    pub lines: u64,
+}
+
+impl WriteFileRequest {
+    pub fn parse(arguments: &str) -> Result<Self, ToolError> {
+        let arguments: WriteFileArguments = serde_json::from_str(arguments)?;
+        let path = parse_workspace_path(&arguments.path)?;
+
+        Ok(Self {
+            path,
+            content: arguments.content,
+        })
+    }
+
+    pub fn display_path(&self) -> String {
+        display_workspace_path(&self.path)
+    }
+
+    pub fn approval_preview(&self, workspace: &Path) -> Result<ToolApprovalPreview, ToolError> {
+        validate_write_size(&self.content, &self.display_path())?;
+        let target = resolve_write_target(workspace, &self.path, &self.display_path())?;
+        let existing = read_existing_utf8(&target, &self.display_path())?;
+        let is_new_file = existing.is_none();
+        let diff = compute_diff(existing.as_deref().unwrap_or(""), &self.content);
+
+        Ok(ToolApprovalPreview::Diff {
+            verb: "write",
+            path: self.display_path(),
+            is_new_file,
+            diff,
+        })
+    }
+
+    pub fn execute(&self, workspace: &Path) -> Result<WriteFileOutput, ToolError> {
+        validate_write_size(&self.content, &self.display_path())?;
+        let target = resolve_write_target(workspace, &self.path, &self.display_path())?;
+
+        fs::write(&target, &self.content).map_err(|source| ToolError::Write {
+            path: self.display_path(),
+            source,
+        })?;
+
+        Ok(WriteFileOutput {
+            ok: true,
+            path: self.display_path(),
+            bytes: self.content.len() as u64,
+            lines: self.content.lines().count() as u64,
+        })
+    }
+}
+
+fn validate_write_size(content: &str, display: &str) -> Result<(), ToolError> {
+    if content.len() as u64 > MAX_FILE_BYTES {
+        return Err(ToolError::TooLarge {
+            path: display.to_owned(),
+            limit: MAX_FILE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Resolves where a `write_file` call would land, tolerating a target that
+/// doesn't exist yet (read/list resolution requires the path to already
+/// exist). The parent directory must already exist; Tapet never creates
+/// directories implicitly.
+fn resolve_write_target(
+    workspace: &Path,
+    path: &Path,
+    display: &str,
+) -> Result<PathBuf, ToolError> {
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|source| ToolError::Workspace { source })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let resolved_parent = match parent {
+        Some(parent) => workspace
+            .join(parent)
+            .canonicalize()
+            .map_err(|_| ToolError::MissingParentDirectory(display.to_owned()))?,
+        None => workspace.clone(),
+    };
+    if !resolved_parent.starts_with(&workspace) {
+        return Err(ToolError::OutsideWorkspace(display.to_owned()));
+    }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| ToolError::UnsafePath(display.to_owned()))?;
+    let target = resolved_parent.join(file_name);
+
+    // If something is already there (possibly through a symlink), make sure
+    // it still resolves inside the workspace and isn't a directory before
+    // writing through it.
+    if let Ok(resolved_target) = target.canonicalize() {
+        if !resolved_target.starts_with(&workspace) {
+            return Err(ToolError::OutsideWorkspace(display.to_owned()));
+        }
+        if resolved_target.is_dir() {
+            return Err(ToolError::NotAFile(display.to_owned()));
+        }
+    }
+    Ok(target)
+}
+
+fn read_existing_utf8(target: &Path, display: &str) -> Result<Option<String>, ToolError> {
+    match fs::read(target) {
+        Ok(bytes) => {
+            if bytes.len() as u64 > MAX_FILE_BYTES {
+                return Err(ToolError::TooLarge {
+                    path: display.to_owned(),
+                    limit: MAX_FILE_BYTES,
+                });
+            }
+            String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| ToolError::NotUtf8(display.to_owned()))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ToolError::Open {
+            path: display.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn compute_diff(old: &str, new: &str) -> Vec<DiffLine> {
+    TextDiff::from_lines(old, new)
+        .iter_all_changes()
+        .map(|change| {
+            let kind = match change.tag() {
+                ChangeTag::Equal => DiffLineKind::Context,
+                ChangeTag::Delete => DiffLineKind::Removed,
+                ChangeTag::Insert => DiffLineKind::Added,
+            };
+            DiffLine {
+                kind,
+                content: change.value().trim_end_matches('\n').to_owned(),
+            }
+        })
+        .collect()
+}
+
 fn display_workspace_path(path: &Path) -> String {
     if path.as_os_str().is_empty() {
         ".".to_owned()
@@ -367,19 +583,26 @@ pub enum ToolError {
     NotAFile(String),
     #[error("`{0}` is not a directory")]
     NotADirectory(String),
-    #[error("`{path}` is larger than the {limit}-byte read limit")]
+    #[error("the parent directory of `{0}` does not exist")]
+    MissingParentDirectory(String),
+    #[error("`{path}` is larger than the {limit}-byte limit")]
     TooLarge { path: String, limit: u64 },
     #[error("`{path}` has more than {limit} entries")]
     TooManyEntries { path: String, limit: usize },
     #[error("could not read `{path}`: {source}")]
     Read { path: String, source: io::Error },
+    #[error("could not write `{path}`: {source}")]
+    Write { path: String, source: io::Error },
     #[error("`{0}` is not UTF-8 text")]
     NotUtf8(String),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ListFilesRequest, ReadFileRequest, ToolError, ToolRequest};
+    use super::{
+        DiffLineKind, ListFilesRequest, ReadFileRequest, ToolApprovalPreview, ToolError,
+        ToolRequest, WriteFileRequest,
+    };
     use std::fs;
     use tempfile::TempDir;
 
@@ -528,6 +751,117 @@ mod tests {
         assert!(matches!(
             ToolRequest::parse("list_files", r#"{"path":"."}"#),
             Ok(ToolRequest::ListFiles(_))
+        ));
+    }
+
+    #[test]
+    fn creates_a_new_file_and_diffs_it_as_all_additions() {
+        let workspace = TempDir::new().unwrap();
+
+        let request =
+            WriteFileRequest::parse(r#"{"path":"notes.txt","content":"one\ntwo\n"}"#).unwrap();
+        let preview = request.approval_preview(workspace.path()).unwrap();
+        let ToolApprovalPreview::Diff {
+            is_new_file, diff, ..
+        } = preview
+        else {
+            panic!("expected a diff preview");
+        };
+        assert!(is_new_file);
+        assert!(diff.iter().all(|line| line.kind == DiffLineKind::Added));
+        assert_eq!(
+            diff.iter()
+                .map(|line| line.content.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+
+        let output = request.execute(workspace.path()).unwrap();
+        assert_eq!(output.path, "notes.txt");
+        assert_eq!(output.bytes, 8);
+        assert_eq!(output.lines, 2);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("notes.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn diffs_an_overwrite_against_existing_content() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("notes.txt"), "one\ntwo\n").unwrap();
+
+        let request =
+            WriteFileRequest::parse(r#"{"path":"notes.txt","content":"one\nthree\n"}"#).unwrap();
+        let preview = request.approval_preview(workspace.path()).unwrap();
+        let ToolApprovalPreview::Diff {
+            is_new_file, diff, ..
+        } = preview
+        else {
+            panic!("expected a diff preview");
+        };
+        assert!(!is_new_file);
+        assert_eq!(
+            diff.iter()
+                .map(|line| (line.kind.clone(), line.content.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (DiffLineKind::Context, "one"),
+                (DiffLineKind::Removed, "two"),
+                (DiffLineKind::Added, "three"),
+            ]
+        );
+
+        request.execute(workspace.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("notes.txt")).unwrap(),
+            "one\nthree\n"
+        );
+    }
+
+    #[test]
+    fn rejects_writes_outside_the_workspace_and_to_missing_parents() {
+        assert!(matches!(
+            WriteFileRequest::parse(r#"{"path":"../escape.txt","content":""}"#),
+            Err(ToolError::UnsafePath(_))
+        ));
+
+        let workspace = TempDir::new().unwrap();
+        let request =
+            WriteFileRequest::parse(r#"{"path":"missing/notes.txt","content":"hi"}"#).unwrap();
+        assert!(matches!(
+            request.execute(workspace.path()),
+            Err(ToolError::MissingParentDirectory(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_overwriting_a_directory_or_non_utf8_file() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        let as_directory = WriteFileRequest::parse(r#"{"path":"src","content":"hi"}"#).unwrap();
+        assert!(matches!(
+            as_directory.execute(workspace.path()),
+            Err(ToolError::NotAFile(_))
+        ));
+
+        fs::write(workspace.path().join("binary"), [0xff, 0xfe]).unwrap();
+        let over_binary = WriteFileRequest::parse(r#"{"path":"binary","content":"hi"}"#).unwrap();
+        assert!(matches!(
+            over_binary.approval_preview(workspace.path()),
+            Err(ToolError::NotUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_content_over_the_size_limit() {
+        let workspace = TempDir::new().unwrap();
+        let content = "x".repeat(128 * 1024 + 1);
+        let arguments = serde_json::json!({"path": "big.txt", "content": content}).to_string();
+        let request = WriteFileRequest::parse(&arguments).unwrap();
+        assert!(matches!(
+            request.execute(workspace.path()),
+            Err(ToolError::TooLarge { .. })
         ));
     }
 }
