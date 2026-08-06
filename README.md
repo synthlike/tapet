@@ -47,6 +47,8 @@ tapet room --with explorer --with doubter       # ad-hoc room
 tapet room --from research --name moon-lab      # from a tapet.toml template
 tapet enter moon-lab                            # resume a room
 tapet history moon-lab                          # print room history
+
+tapet --config other.toml agents                # use a config other than tapet.toml
 ```
 
 Rooms default to their first (or default) agent; address others with

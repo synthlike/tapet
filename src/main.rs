@@ -22,7 +22,7 @@ use room::{
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use store::{RoomSummary, Store, StoreError};
 use stream::{Completion, ResponseRound, StreamEvent, ToolCall};
@@ -156,17 +156,40 @@ fn next_argument(args: &mut impl Iterator<Item = OsString>) -> Result<String, Ap
         .map_err(|_| AppError::Usage)
 }
 
+fn extract_config_path(
+    args: impl Iterator<Item = OsString>,
+) -> Result<(PathBuf, Vec<OsString>), AppError> {
+    let mut config_path = None;
+    let mut remaining = Vec::new();
+    let mut args = args;
+    while let Some(argument) = args.next() {
+        if argument == "--config" {
+            if config_path.is_some() {
+                return Err(AppError::Usage);
+            }
+            config_path = Some(PathBuf::from(args.next().ok_or(AppError::Usage)?));
+        } else {
+            remaining.push(argument);
+        }
+    }
+    Ok((
+        config_path.unwrap_or_else(|| PathBuf::from(CONFIG_PATH)),
+        remaining,
+    ))
+}
+
 async fn try_main() -> Result<(), AppError> {
-    let command = selected_command(env::args_os().skip(1))?;
+    let (config_path, remaining) = extract_config_path(env::args_os().skip(1))?;
+    let command = selected_command(remaining.into_iter())?;
 
     match command {
         Command::Agents => {
-            let config = Config::load(Path::new(CONFIG_PATH))?;
+            let config = Config::load(&config_path)?;
             let stdout = io::stdout();
             write_agents(config.agents(), &mut stdout.lock())?;
         }
         Command::Templates => {
-            let config = Config::load(Path::new(CONFIG_PATH))?;
+            let config = Config::load(&config_path)?;
             let stdout = io::stdout();
             write_templates(config.rooms(), &mut stdout.lock())?;
         }
@@ -180,7 +203,7 @@ async fn try_main() -> Result<(), AppError> {
             agent: agent_name,
             message,
         } => {
-            let config = Config::load(Path::new(CONFIG_PATH))?;
+            let config = Config::load(&config_path)?;
             let agent = config.agent(&agent_name)?;
             let client = OpenAiClient::from_agent(agent)?;
             let messages = [Message::user(message)];
@@ -195,7 +218,7 @@ async fn try_main() -> Result<(), AppError> {
             .await?;
         }
         Command::Room { source, name } => {
-            let config = Config::load(Path::new(CONFIG_PATH))?;
+            let config = Config::load(&config_path)?;
             let (agent_names, description, prompt) = match source {
                 RoomSource::With(agents) => (agents, String::new(), String::new()),
                 RoomSource::From(template) => {
@@ -218,7 +241,7 @@ async fn try_main() -> Result<(), AppError> {
                 .await?;
             if has_interactive_terminal() {
                 let name = room.name().to_string();
-                run_room_ui(store, room, Vec::new()).await?;
+                run_room_ui(store, room, Vec::new(), &config_path).await?;
                 println!("Room saved: {name}");
             } else {
                 let input = BufReader::new(tokio::io::stdin());
@@ -235,7 +258,7 @@ async fn try_main() -> Result<(), AppError> {
             let messages = store.room_history(room.id()).await?;
             if has_interactive_terminal() {
                 let name = room.name().to_string();
-                run_room_ui(store, room, messages).await?;
+                run_room_ui(store, room, messages, &config_path).await?;
                 println!("Room saved: {name}");
             } else {
                 let input = BufReader::new(tokio::io::stdin());
@@ -350,6 +373,7 @@ async fn run_room_ui(
     store: Store,
     mut room: Room,
     messages: Vec<RoomMessage>,
+    config_path: &Path,
 ) -> Result<(), AppError> {
     let mut terminal = TerminalUi::start()?;
     let mut terminal_events = EventStream::new();
@@ -376,7 +400,7 @@ async fn run_room_ui(
                 }
             }
             InputAction::AddAgent(name) => {
-                add_room_participant_ui(&store, &mut room, &name, &mut state).await?;
+                add_room_participant_ui(&store, &mut room, &name, &mut state, config_path).await?;
             }
         }
     }
@@ -387,12 +411,13 @@ async fn add_room_participant_ui(
     room: &mut Room,
     agent_name: &str,
     state: &mut RoomUi,
+    config_path: &Path,
 ) -> Result<(), AppError> {
     if room.participant(agent_name).is_some() {
         state.set_error(format!("@{agent_name} is already in this room"));
         return Ok(());
     }
-    let config = match Config::load(Path::new(CONFIG_PATH)) {
+    let config = match Config::load(config_path) {
         Ok(config) => config,
         Err(error) => {
             state.set_error(error.to_string());
@@ -1195,7 +1220,7 @@ async fn main() {
 #[derive(Debug, Error)]
 enum AppError {
     #[error(
-        "usage: tapet agents\n       tapet templates\n       tapet rooms\n       tapet ask <agent> <message>\n       tapet room [--name <name>] --with <agent> [--with <agent>...]\n       tapet room [--name <name>] --from <template>\n       tapet enter <room>\n       tapet history <room>"
+        "usage: tapet [--config <path>] agents\n       tapet [--config <path>] templates\n       tapet rooms\n       tapet [--config <path>] ask <agent> <message>\n       tapet [--config <path>] room [--name <name>] --with <agent> [--with <agent>...]\n       tapet [--config <path>] room [--name <name>] --from <template>\n       tapet enter <room>\n       tapet history <room>"
     )]
     Usage,
     #[error(transparent)]
@@ -1221,8 +1246,9 @@ enum AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, RoomSource, UserInput, read_user_input, render_events, render_room_events,
-        selected_command, write_agents, write_room_history, write_room_list, write_templates,
+        Command, RoomSource, UserInput, extract_config_path, read_user_input, render_events,
+        render_room_events, selected_command, write_agents, write_room_history, write_room_list,
+        write_templates,
     };
     use crate::config::Config;
     use crate::openai::{ProviderError, decode_stream};
@@ -1235,6 +1261,67 @@ mod tests {
     use std::io::{self, Write};
     use tempfile::TempDir;
     use tokio::io::BufReader;
+
+    #[test]
+    fn extracts_the_config_flag_from_anywhere_in_the_arguments() {
+        let (path, remaining) = extract_config_path(
+            [
+                OsString::from("--config"),
+                OsString::from("custom.toml"),
+                OsString::from("agents"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(path, std::path::PathBuf::from("custom.toml"));
+        assert_eq!(remaining, [OsString::from("agents")]);
+
+        let (path, remaining) = extract_config_path(
+            [
+                OsString::from("ask"),
+                OsString::from("explorer"),
+                OsString::from("--config"),
+                OsString::from("custom.toml"),
+                OsString::from("hello"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(path, std::path::PathBuf::from("custom.toml"));
+        assert_eq!(
+            remaining,
+            [
+                OsString::from("ask"),
+                OsString::from("explorer"),
+                OsString::from("hello")
+            ]
+        );
+    }
+
+    #[test]
+    fn defaults_the_config_path_when_the_flag_is_absent() {
+        let (path, remaining) =
+            extract_config_path([OsString::from("agents")].into_iter()).unwrap();
+        assert_eq!(path, std::path::PathBuf::from("tapet.toml"));
+        assert_eq!(remaining, [OsString::from("agents")]);
+    }
+
+    #[test]
+    fn rejects_a_dangling_or_repeated_config_flag() {
+        assert!(extract_config_path([OsString::from("--config")].into_iter()).is_err());
+        assert!(
+            extract_config_path(
+                [
+                    OsString::from("--config"),
+                    OsString::from("one.toml"),
+                    OsString::from("--config"),
+                    OsString::from("two.toml"),
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn parses_agent_listing_command() {
