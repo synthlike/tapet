@@ -12,6 +12,7 @@ use tokio_rusqlite::Connection;
 use tokio_rusqlite::rusqlite::{self, TransactionBehavior, params};
 
 const SCHEMA_VERSION: i64 = 2;
+const MAX_RANDOM_ROOM_ATTEMPTS: usize = 64;
 const MIGRATION_001: &str = include_str!("../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_tool_calls.sql");
 
@@ -79,11 +80,42 @@ impl Store {
 
     pub async fn create_room(
         &self,
+        requested_id: Option<RoomId>,
         participants: Vec<AgentSnapshot>,
         description: String,
         prompt: String,
     ) -> Result<Room, StoreError> {
-        let id = RoomId::new();
+        if let Some(id) = requested_id {
+            return self
+                .insert_room(id, participants, description, prompt)
+                .await;
+        }
+
+        for _ in 0..MAX_RANDOM_ROOM_ATTEMPTS {
+            let id = RoomId::new();
+            match self
+                .insert_room(
+                    id,
+                    participants.clone(),
+                    description.clone(),
+                    prompt.clone(),
+                )
+                .await
+            {
+                Err(StoreError::RoomAlreadyExists(_)) => continue,
+                result => return result,
+            }
+        }
+        Err(StoreError::RandomRoomNameExhausted)
+    }
+
+    async fn insert_room(
+        &self,
+        id: RoomId,
+        participants: Vec<AgentSnapshot>,
+        description: String,
+        prompt: String,
+    ) -> Result<Room, StoreError> {
         let stored_id = id.to_string();
         let stored_participants = participants.clone();
         let stored_description = description.clone();
@@ -94,6 +126,14 @@ impl Store {
             .call(move |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let room_exists = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1)",
+                    [&stored_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if room_exists {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
                 transaction.execute(
                     "INSERT INTO rooms (
                         id, description, system_prompt, created_at, updated_at
@@ -120,7 +160,13 @@ impl Store {
                 }
                 transaction.commit()
             })
-            .await?;
+            .await
+            .map_err(|error| match error {
+                tokio_rusqlite::Error::Error(rusqlite::Error::QueryReturnedNoRows) => {
+                    StoreError::RoomAlreadyExists(id.to_string())
+                }
+                other => StoreError::Worker(other),
+            })?;
 
         Ok(Room::new(id, participants, description, prompt))
     }
@@ -510,6 +556,10 @@ pub enum StoreError {
     UnsupportedSchemaVersion { found: i64, supported: i64 },
     #[error("unknown room `{0}`")]
     UnknownRoom(String),
+    #[error("a room named `{0}` already exists")]
+    RoomAlreadyExists(String),
+    #[error("could not generate an unused random room name")]
+    RandomRoomNameExhausted,
     #[error("token count {0} cannot be stored")]
     TokenCountOutOfRange(u64),
 }
@@ -518,7 +568,7 @@ pub enum StoreError {
 mod tests {
     use super::{Store, StoreError};
     use crate::agent::AgentSnapshot;
-    use crate::room::RoomMessage;
+    use crate::room::{RoomId, RoomMessage};
     use crate::stream::Completion;
     use tempfile::TempDir;
     use tokio_rusqlite::rusqlite::{Connection, TransactionBehavior};
@@ -534,6 +584,7 @@ mod tests {
         ];
         let room = store
             .create_room(
+                None,
                 participants.clone(),
                 "Research room".to_owned(),
                 "Cite evidence".to_owned(),
@@ -578,10 +629,47 @@ mod tests {
             .unwrap();
         let participant = AgentSnapshot::fixture("Explore");
         let room = store
-            .create_room(vec![participant.clone()], String::new(), String::new())
+            .create_room(
+                None,
+                vec![participant.clone()],
+                String::new(),
+                String::new(),
+            )
             .await
             .unwrap();
         assert_eq!(room.participants(), [participant]);
+    }
+
+    #[tokio::test]
+    async fn persists_custom_room_names_and_rejects_duplicates() {
+        let temporary = TempDir::new().unwrap();
+        let store = Store::open(temporary.path().join("tapet.db"))
+            .await
+            .unwrap();
+        let id = "sweaty-warroom".parse::<RoomId>().unwrap();
+        let participant = AgentSnapshot::fixture("Explore");
+
+        let room = store
+            .create_room(
+                Some(id.clone()),
+                vec![participant.clone()],
+                String::new(),
+                String::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(room.id(), &id);
+        assert!(matches!(
+            store
+                .create_room(
+                    Some(id),
+                    vec![participant],
+                    String::new(),
+                    String::new(),
+                )
+                .await,
+            Err(StoreError::RoomAlreadyExists(name)) if name == "sweaty-warroom"
+        ));
     }
 
     #[tokio::test]
@@ -591,6 +679,7 @@ mod tests {
         let store = Store::open(&path).await.unwrap();
         let room = store
             .create_room(
+                None,
                 vec![AgentSnapshot::fixture("Explore")],
                 String::new(),
                 String::new(),
@@ -702,6 +791,7 @@ mod tests {
             .unwrap();
         let room = store
             .create_room(
+                None,
                 vec![AgentSnapshot::fixture("Explore")],
                 String::new(),
                 String::new(),

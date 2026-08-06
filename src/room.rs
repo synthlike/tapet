@@ -11,7 +11,80 @@ pub struct RoomId(String);
 
 impl RoomId {
     pub fn new() -> Self {
-        Self(format!("room_{}", Uuid::new_v4().simple()))
+        const ADJECTIVES: &[&str] = &[
+            "awkward",
+            "brave",
+            "caffeinated",
+            "chaotic",
+            "confused",
+            "cosmic",
+            "crispy",
+            "curious",
+            "dramatic",
+            "electric",
+            "feral",
+            "fearless",
+            "frantic",
+            "fuzzy",
+            "glittery",
+            "grumpy",
+            "haunted",
+            "noisy",
+            "ominous",
+            "rubber",
+            "sleepy",
+            "sneaky",
+            "spicy",
+            "stubborn",
+            "suspicious",
+            "sweaty",
+            "tactical",
+            "tiny",
+            "turbo",
+            "wobbly",
+            "wonky",
+            "zesty",
+        ];
+        const PLACES: &[&str] = &[
+            "aquarium",
+            "basement",
+            "bunker",
+            "cabal",
+            "campfire",
+            "circus",
+            "clubhouse",
+            "cockpit",
+            "committee",
+            "dungeon",
+            "factory",
+            "fortress",
+            "garage",
+            "headquarters",
+            "hive",
+            "hotline",
+            "kitchen",
+            "laboratory",
+            "lighthouse",
+            "moonbase",
+            "newsroom",
+            "observatory",
+            "orchestra",
+            "pantry",
+            "parliament",
+            "roundtable",
+            "spaceship",
+            "thinktank",
+            "tribunal",
+            "volcano",
+            "warroom",
+            "workshop",
+        ];
+
+        let random = Uuid::new_v4();
+        let bytes = random.as_bytes();
+        let adjective = ADJECTIVES[usize::from(bytes[0]) % ADJECTIVES.len()];
+        let place = PLACES[usize::from(bytes[1]) % PLACES.len()];
+        Self(format!("{adjective}-{place}"))
     }
 }
 
@@ -25,19 +98,32 @@ impl FromStr for RoomId {
     type Err = RoomIdError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let original = value;
-        let uuid = value
-            .strip_prefix("room_")
-            .ok_or_else(|| RoomIdError(original.to_owned()))
-            .and_then(|value| {
-                Uuid::parse_str(value).map_err(|_| RoomIdError(original.to_owned()))
-            })?;
-        Ok(Self(format!("room_{}", uuid.simple())))
+        if let Some(uuid) = value.strip_prefix("room_")
+            && let Ok(uuid) = Uuid::parse_str(uuid)
+        {
+            return Ok(Self(format!("room_{}", uuid.simple())));
+        }
+        if is_valid_room_name(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(RoomIdError(value.to_owned()))
+        }
     }
 }
 
+fn is_valid_room_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
+}
+
 #[derive(Debug, Error)]
-#[error("invalid room ID `{0}`")]
+#[error("invalid room name `{0}`; use 1-64 lowercase letters, numbers, and single hyphens")]
 pub struct RoomIdError(String);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -338,5 +424,35 @@ mod tests {
     fn room_ids_round_trip() {
         let id = RoomId::new();
         assert_eq!(id.to_string().parse::<RoomId>().unwrap(), id);
+        assert!(id.to_string().contains('-'));
+    }
+
+    #[test]
+    fn accepts_custom_slugs_and_legacy_room_ids() {
+        assert_eq!(
+            "sweaty-warroom".parse::<RoomId>().unwrap().to_string(),
+            "sweaty-warroom"
+        );
+        assert_eq!(
+            "room_550e8400e29b41d4a716446655440000"
+                .parse::<RoomId>()
+                .unwrap()
+                .to_string(),
+            "room_550e8400e29b41d4a716446655440000"
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_or_awkward_room_names() {
+        for name in [
+            "",
+            "WarRoom",
+            "two words",
+            "-leading",
+            "trailing-",
+            "two--dashes",
+        ] {
+            assert!(name.parse::<RoomId>().is_err(), "accepted {name:?}");
+        }
     }
 }

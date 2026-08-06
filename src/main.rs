@@ -38,10 +38,20 @@ const DATABASE_PATH: &str = ".tapet/tapet.db";
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Agents,
-    Ask { agent: String, message: String },
-    Room { source: RoomSource },
-    Enter { room: RoomId },
-    History { room: RoomId },
+    Ask {
+        agent: String,
+        message: String,
+    },
+    Room {
+        source: RoomSource,
+        name: Option<RoomId>,
+    },
+    Enter {
+        room: RoomId,
+    },
+    History {
+        room: RoomId,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -76,9 +86,8 @@ fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command,
             let arguments: Result<Vec<_>, _> = args
                 .map(|argument| argument.into_string().map_err(|_| AppError::Usage))
                 .collect();
-            Ok(Command::Room {
-                source: parse_room_source(&arguments?)?,
-            })
+            let (source, name) = parse_room_options(&arguments?)?;
+            Ok(Command::Room { source, name })
         }
         "enter" => {
             let room = next_argument(&mut args)?.parse()?;
@@ -98,25 +107,32 @@ fn selected_command(mut args: impl Iterator<Item = OsString>) -> Result<Command,
     }
 }
 
-fn parse_room_source(arguments: &[String]) -> Result<RoomSource, AppError> {
-    if let [flag, name] = arguments
-        && flag == "--from"
-        && !name.is_empty()
-    {
-        return Ok(RoomSource::From(name.clone()));
-    }
-
+fn parse_room_options(arguments: &[String]) -> Result<(RoomSource, Option<RoomId>), AppError> {
     if arguments.is_empty() || !arguments.len().is_multiple_of(2) {
         return Err(AppError::Usage);
     }
     let mut agents = Vec::new();
+    let mut template = None;
+    let mut name = None;
     for pair in arguments.chunks_exact(2) {
-        if pair[0] != "--with" || pair[1].is_empty() || pair[1].starts_with("--") {
+        if pair[1].is_empty() || pair[1].starts_with("--") {
             return Err(AppError::Usage);
         }
-        agents.push(pair[1].clone());
+        match pair[0].as_str() {
+            "--with" if template.is_none() => agents.push(pair[1].clone()),
+            "--from" if template.is_none() && agents.is_empty() => {
+                template = Some(pair[1].clone());
+            }
+            "--name" if name.is_none() => name = Some(pair[1].parse()?),
+            _ => return Err(AppError::Usage),
+        }
     }
-    Ok(RoomSource::With(agents))
+    let source = match (template, agents.is_empty()) {
+        (Some(template), true) => RoomSource::From(template),
+        (None, false) => RoomSource::With(agents),
+        _ => return Err(AppError::Usage),
+    };
+    Ok((source, name))
 }
 
 fn next_argument(args: &mut impl Iterator<Item = OsString>) -> Result<String, AppError> {
@@ -153,7 +169,7 @@ async fn try_main() -> Result<(), AppError> {
             )
             .await?;
         }
-        Command::Room { source } => {
+        Command::Room { source, name } => {
             let config = Config::load(Path::new(CONFIG_PATH))?;
             let (agent_names, description, prompt) = match source {
                 RoomSource::With(agents) => (agents, String::new(), String::new()),
@@ -172,7 +188,9 @@ async fn try_main() -> Result<(), AppError> {
                 .collect::<Result<Vec<_>, _>>()?;
             validate_participants(&participants)?;
             let store = Store::open(DATABASE_PATH).await?;
-            let room = store.create_room(participants, description, prompt).await?;
+            let room = store
+                .create_room(name, participants, description, prompt)
+                .await?;
             if has_interactive_terminal() {
                 let id = room.id().to_string();
                 run_room_ui(store, room, Vec::new()).await?;
@@ -1059,7 +1077,7 @@ async fn main() {
 #[derive(Debug, Error)]
 enum AppError {
     #[error(
-        "usage: tapet agents\n       tapet ask <agent> <message>\n       tapet room --with <agent> [--with <agent>...]\n       tapet room --from <template>\n       tapet enter <room>\n       tapet history <room>"
+        "usage: tapet agents\n       tapet ask <agent> <message>\n       tapet room [--name <name>] --with <agent> [--with <agent>...]\n       tapet room [--name <name>] --from <template>\n       tapet enter <room>\n       tapet history <room>"
     )]
     Usage,
     #[error(transparent)]
@@ -1139,7 +1157,8 @@ mod tests {
             )
             .unwrap(),
             Command::Room {
-                source: RoomSource::With(vec!["explorer".to_owned()])
+                source: RoomSource::With(vec!["explorer".to_owned()]),
+                name: None,
             }
         );
         assert_eq!(
@@ -1155,7 +1174,8 @@ mod tests {
             )
             .unwrap(),
             Command::Room {
-                source: RoomSource::With(vec!["explorer".to_owned(), "reviewer".to_owned()])
+                source: RoomSource::With(vec!["explorer".to_owned(), "reviewer".to_owned()]),
+                name: None,
             }
         );
         assert_eq!(
@@ -1169,7 +1189,27 @@ mod tests {
             )
             .unwrap(),
             Command::Room {
-                source: RoomSource::From("research".to_owned())
+                source: RoomSource::From("research".to_owned()),
+                name: None,
+            }
+        );
+
+        let named = "sweaty-warroom".parse().unwrap();
+        assert_eq!(
+            selected_command(
+                [
+                    OsString::from("room"),
+                    OsString::from("--name"),
+                    OsString::from("sweaty-warroom"),
+                    OsString::from("--from"),
+                    OsString::from("research"),
+                ]
+                .into_iter()
+            )
+            .unwrap(),
+            Command::Room {
+                source: RoomSource::From("research".to_owned()),
+                name: Some(named),
             }
         );
 
@@ -1216,8 +1256,36 @@ mod tests {
                 .is_err()
         );
         assert!(
-            selected_command([OsString::from("enter"), OsString::from("not-a-room")].into_iter())
+            selected_command([OsString::from("enter"), OsString::from("Not_A_Room")].into_iter())
                 .is_err()
+        );
+        assert!(
+            selected_command(
+                [
+                    OsString::from("room"),
+                    OsString::from("--name"),
+                    OsString::from("Bad Name"),
+                    OsString::from("--with"),
+                    OsString::from("explorer"),
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+        assert!(
+            selected_command(
+                [
+                    OsString::from("room"),
+                    OsString::from("--name"),
+                    OsString::from("one"),
+                    OsString::from("--name"),
+                    OsString::from("two"),
+                    OsString::from("--with"),
+                    OsString::from("explorer"),
+                ]
+                .into_iter()
+            )
+            .is_err()
         );
     }
 
